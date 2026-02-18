@@ -56,20 +56,26 @@ fn getString(obj: std.json.Value, field: []const u8) ?[]const u8 {
 
 // ── tool: shell ───────────────────────────────────────────────────────────────
 
-fn toolShell(ctx: *ToolContext, args_json: []const u8) !ToolResult {
-    // Expected: {"command":"..."}
-    const parsed = std.json.parseFromSlice(std.json.Value, ctx.allocator, args_json, .{}) catch {
-        return ToolResult.literal(false, "invalid JSON in shell args");
-    };
-    defer parsed.deinit();
+/// Join a JSON string array into a single space-separated shell command.
+/// Caller owns the returned slice.
+fn joinCmdArray(allocator: std.mem.Allocator, arr: std.json.Array) ![]u8 {
+    var parts = std.ArrayList(u8).init(allocator);
+    errdefer parts.deinit();
+    for (arr.items, 0..) |item, idx| {
+        if (idx > 0) try parts.append(' ');
+        switch (item) {
+            .string => |s| try parts.appendSlice(s),
+            else => {},
+        }
+    }
+    return parts.toOwnedSlice();
+}
 
-    const cmd = getString(parsed.value, "command") orelse "echo \"no command provided\"";
-
+/// Run a shell command string and return a capped ToolResult.
+fn runShellCmd(ctx: *ToolContext, cmd: []const u8) !ToolResult {
     if (!ctx.policy.allowShellCommand(cmd)) {
         return ToolResult.literal(false, "command blocked by security policy");
     }
-
-    // Emit audit log entry before executing.
     ctx.policy.auditLog("shell", cmd) catch {};
 
     const result = std.process.Child.run(.{
@@ -82,8 +88,35 @@ fn toolShell(ctx: *ToolContext, args_json: []const u8) !ToolResult {
     defer ctx.allocator.free(result.stdout);
     defer ctx.allocator.free(result.stderr);
 
-    const output = try ctx.allocator.dupe(u8, if (result.stdout.len > 0) result.stdout else result.stderr);
+    const output = try capOutput(ctx.allocator,
+        if (result.stdout.len > 0) result.stdout else result.stderr);
     return ToolResult.owned(result.term == .Exited and result.term.Exited == 0, output);
+}
+
+fn toolShell(ctx: *ToolContext, args_json: []const u8) !ToolResult {
+    // Accepts several model-output variations:
+    //   {"command": "ls -l /tmp"}            — canonical string form
+    //   {"cmd": "ls -l /tmp"}                — "cmd" alias
+    //   {"cmd": ["ls", "-l", "/tmp"]}        — array form (model sometimes emits this)
+    //   {"command": ["ls", "-l", "/tmp"]}    — array form with canonical key
+    const parsed = std.json.parseFromSlice(std.json.Value, ctx.allocator, args_json, .{}) catch {
+        return ToolResult.literal(false, "invalid JSON in shell args");
+    };
+    defer parsed.deinit();
+
+    // Try "command" then "cmd" — both are accepted.
+    const val = parsed.value.object.get("command") orelse
+                parsed.value.object.get("cmd");
+
+    switch (val orelse return runShellCmd(ctx, "echo \"no command provided\"")) {
+        .string => |s| return runShellCmd(ctx, s),
+        .array  => |arr| {
+            const joined = try joinCmdArray(ctx.allocator, arr);
+            defer ctx.allocator.free(joined);
+            return runShellCmd(ctx, joined);
+        },
+        else => return runShellCmd(ctx, "echo \"no command provided\""),
+    }
 }
 
 // ── tool: file_read ───────────────────────────────────────────────────────────
@@ -552,7 +585,7 @@ pub fn buildCoreTools(
     var list = std.ArrayList(Tool).init(allocator);
     errdefer list.deinit();
 
-    try list.append(Tool{ .name = "shell",                .description = "Run a shell command",                                    .executeFn = toolShell });
+    try list.append(Tool{ .name = "shell",                .description = "Run a shell command. Args: {\"command\": \"<shell string>\"}",  .executeFn = toolShell });
     try list.append(Tool{ .name = "file_read",            .description = "Read a file from the workspace",                        .executeFn = toolFileRead });
     try list.append(Tool{ .name = "file_write",           .description = "Write content to a file in the workspace",              .executeFn = toolFileWrite });
     try list.append(Tool{ .name = "memory_store",         .description = "Store a value in memory by key",                       .executeFn = toolMemoryStore });

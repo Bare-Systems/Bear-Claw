@@ -481,15 +481,37 @@ fn dispatchAllToolCalls(
 
         // Arguments: check inside the function object first (Format A),
         // then fall back to a top-level "arguments" key (Format B).
+        //
+        // Models may emit arguments as:
+        //   a) a JSON string:  "arguments": "{\"command\":\"ls\"}"
+        //   b) an inline object: "arguments": {"command":"ls"}
+        // Case (b) requires re-serialization so the tool receives a JSON string.
+        // We allocate the serialized form and track it for deferred free.
+        var args_json_owned: ?[]u8 = null;
+        defer if (args_json_owned) |s| allocator.free(s);
+
         const args_json: []const u8 = blk: {
-            // Format A: {"function": {"name": "...", "arguments": "..."}}
+            // Helper: serialize a Value back to a JSON string.
+            const serializeArgs = struct {
+                fn run(alloc: std.mem.Allocator, v: std.json.Value) ![]u8 {
+                    var buf = std.ArrayList(u8).init(alloc);
+                    errdefer buf.deinit();
+                    try std.json.stringify(v, .{}, buf.writer());
+                    return buf.toOwnedSlice();
+                }
+            }.run;
+
+            // Format A: {"function": {"name": "...", "arguments": ...}}
             if (call.object.get("function")) |func_val| {
                 if (func_val == .object) {
                     if (func_val.object.get("arguments")) |av| {
                         switch (av) {
                             .string => |s| break :blk s,
-                            // arguments is already an object — serialize it back
-                            else => break :blk "{}",
+                            else => {
+                                // arguments is an inline object — serialize it
+                                args_json_owned = try serializeArgs(allocator, av);
+                                break :blk args_json_owned.?;
+                            },
                         }
                     }
                 }
@@ -498,7 +520,10 @@ fn dispatchAllToolCalls(
             if (call.object.get("arguments")) |av| {
                 switch (av) {
                     .string => |s| break :blk s,
-                    else => break :blk "{}",
+                    else => {
+                        args_json_owned = try serializeArgs(allocator, av);
+                        break :blk args_json_owned.?;
+                    },
                 }
             }
             break :blk "{}";
