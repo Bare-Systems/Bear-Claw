@@ -188,6 +188,43 @@ pub fn runAgentOnceCaptured(
     return buf.toOwnedSlice();
 }
 
+/// Remove any {"tool_calls":[...]} JSON block that the model leaked into
+/// a final prose response. Scans for the pattern and cuts it out, returning
+/// a slice into the original buffer (no allocation). If no JSON is found,
+/// returns the input unchanged.
+fn stripToolCallJson(input: []const u8) []const u8 {
+    // Find the start of a tool_calls JSON block.
+    const marker = "{\"tool_calls\"";
+    const start = std.mem.indexOf(u8, input, marker) orelse return input;
+
+    // Walk forward to find the matching closing brace.
+    var depth: usize = 0;
+    var in_string = false;
+    var escape_next = false;
+    var i = start;
+    while (i < input.len) : (i += 1) {
+        const c = input[i];
+        if (escape_next) { escape_next = false; continue; }
+        if (c == '\\' and in_string) { escape_next = true; continue; }
+        if (c == '"') { in_string = !in_string; continue; }
+        if (in_string) continue;
+        if (c == '{') depth += 1
+        else if (c == '}') {
+            depth -= 1;
+            if (depth == 0) {
+                // Splice out [start..i+1], return the surrounding prose joined.
+                const before = std.mem.trimRight(u8, input[0..start], " \t\n");
+                const after  = std.mem.trimLeft(u8, input[i+1..], " \t\n");
+                // If both sides are non-empty we'd need allocation — just return
+                // the before-prose (the more useful half for the user).
+                if (before.len > 0) return before;
+                return after;
+            }
+        }
+    }
+    return input;
+}
+
 fn runAgentOnceToWriter(
     allocator: std.mem.Allocator,
     cfg: *const config_mod.Config,
@@ -384,8 +421,9 @@ fn runAgentOnceToWriter(
             try msg.appendSlice(context.items);
             try msg.appendSlice(
                 "\n[Instructions] The tool has returned results above. " ++
-                "Now respond to the user's original question in plain, friendly text. " ++
-                "Do NOT output any JSON or tool_calls. Summarize the results clearly.",
+                "Respond in plain, friendly text ONLY. " ++
+                "ABSOLUTELY NO JSON. NO tool_calls. NO code blocks. " ++
+                "Just a natural language summary of what happened.",
             );
             break :blk try msg.toOwnedSlice();
         };
@@ -413,8 +451,14 @@ fn runAgentOnceToWriter(
 
         if (!dispatched) {
             // No tool calls – this is the final text reply.
+            // Strip any leaked tool_call JSON blocks before sending to the channel.
+            // This handles the case where the model mixes prose + JSON in one response.
             try memory.store("last_message", user_message);
-            try out.print("{s}\n", .{reply});
+            const clean = stripToolCallJson(reply);
+            const trimmed = std.mem.trim(u8, clean, " \t\r\n");
+            if (trimmed.len > 0) {
+                try out.print("{s}\n", .{trimmed});
+            }
             return;
         }
 
