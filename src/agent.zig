@@ -515,11 +515,11 @@ fn dispatchAllToolCalls(
 
             const result = tool.executeFn(&ctx, args_json) catch |err| blk: {
                 const msg = try std.fmt.allocPrint(allocator, "tool error: {}", .{err});
-                break :blk tools_mod.ToolResult{ .success = false, .output = msg };
+                break :blk tools_mod.ToolResult.owned(false, msg);
             };
-            // result.output is always an owned allocation from the tool (or the
-            // error branch above). Free it once we've formatted the context entry.
-            defer allocator.free(result.output);
+            // Free output only if the tool heap-allocated it.
+            // String literals (allocated=false) must NOT be freed.
+            defer if (result.allocated) allocator.free(result.output);
 
             // Append result to context buffer.
             const status = if (result.success) "ok" else "error";

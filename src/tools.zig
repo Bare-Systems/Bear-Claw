@@ -4,8 +4,23 @@ const memory_mod = @import("memory.zig");
 const mcp_mod = @import("mcp_client.zig");
 
 pub const ToolResult = struct {
-    success: bool,
-    output: []const u8,
+    success:   bool,
+    output:    []const u8,
+    /// true  → output was heap-allocated; caller must free it.
+    /// false → output is a string literal or borrowed slice; do NOT free.
+    allocated: bool = false,
+
+    /// Convenience constructor for an allocated result (the common case for
+    /// success paths that build a string with allocPrint/dupe).
+    pub fn owned(success: bool, output: []const u8) ToolResult {
+        return .{ .success = success, .output = output, .allocated = true };
+    }
+
+    /// Convenience constructor for an unallocated result (error literals,
+    /// borrowed slices). Safe to return from any tool without an allocator.
+    pub fn literal(success: bool, output: []const u8) ToolResult {
+        return .{ .success = success, .output = output, .allocated = false };
+    }
 };
 
 pub const Tool = struct {
@@ -44,14 +59,14 @@ fn getString(obj: std.json.Value, field: []const u8) ?[]const u8 {
 fn toolShell(ctx: *ToolContext, args_json: []const u8) !ToolResult {
     // Expected: {"command":"..."}
     const parsed = std.json.parseFromSlice(std.json.Value, ctx.allocator, args_json, .{}) catch {
-        return ToolResult{ .success = false, .output = "invalid JSON in shell args" };
+        return ToolResult.literal(false, "invalid JSON in shell args");
     };
     defer parsed.deinit();
 
     const cmd = getString(parsed.value, "command") orelse "echo \"no command provided\"";
 
     if (!ctx.policy.allowShellCommand(cmd)) {
-        return ToolResult{ .success = false, .output = "command blocked by security policy" };
+        return ToolResult.literal(false, "command blocked by security policy");
     }
 
     // Emit audit log entry before executing.
@@ -62,13 +77,13 @@ fn toolShell(ctx: *ToolContext, args_json: []const u8) !ToolResult {
         .argv = &[_][]const u8{ "/bin/sh", "-c", cmd },
     }) catch |err| {
         const msg = try std.fmt.allocPrint(ctx.allocator, "shell exec failed: {}", .{err});
-        return ToolResult{ .success = false, .output = msg };
+        return ToolResult.owned(false, msg);
     };
     defer ctx.allocator.free(result.stdout);
     defer ctx.allocator.free(result.stderr);
 
     const output = try ctx.allocator.dupe(u8, if (result.stdout.len > 0) result.stdout else result.stderr);
-    return ToolResult{ .success = result.term == .Exited and result.term.Exited == 0, .output = output };
+    return ToolResult.owned(result.term == .Exited and result.term.Exited == 0, output);
 }
 
 // ── tool: file_read ───────────────────────────────────────────────────────────
@@ -76,36 +91,36 @@ fn toolShell(ctx: *ToolContext, args_json: []const u8) !ToolResult {
 fn toolFileRead(ctx: *ToolContext, args_json: []const u8) !ToolResult {
     // Expected: {"path":"..."}
     const parsed = std.json.parseFromSlice(std.json.Value, ctx.allocator, args_json, .{}) catch {
-        return ToolResult{ .success = false, .output = "invalid JSON in file_read args" };
+        return ToolResult.literal(false, "invalid JSON in file_read args");
     };
     defer parsed.deinit();
 
     const path = getString(parsed.value, "path") orelse {
-        return ToolResult{ .success = false, .output = "file_read: missing 'path' argument" };
+        return ToolResult.literal(false, "file_read: missing 'path' argument");
     };
 
     // Security: reject paths that escape the workspace.
     if (!ctx.policy.allowPath(path)) {
-        return ToolResult{ .success = false, .output = "file_read: path outside workspace is not allowed" };
+        return ToolResult.literal(false, "file_read: path outside workspace is not allowed");
     }
 
     ctx.policy.auditLog("file_read", path) catch {};
 
     const file = std.fs.cwd().openFile(path, .{}) catch |err| {
         const msg = try std.fmt.allocPrint(ctx.allocator, "file_read: cannot open '{s}': {}", .{ path, err });
-        return ToolResult{ .success = false, .output = msg };
+        return ToolResult.owned(false, msg);
     };
     defer file.close();
 
     const raw_content = file.readToEndAlloc(ctx.allocator, 4 * 1024 * 1024) catch |err| {
         const msg = try std.fmt.allocPrint(ctx.allocator, "file_read: read error: {}", .{err});
-        return ToolResult{ .success = false, .output = msg };
+        return ToolResult.owned(false, msg);
     };
     defer ctx.allocator.free(raw_content);
 
     // T2-5: Cap output to MAX_TOOL_OUTPUT_CHARS to protect context window.
     const content = try capOutput(ctx.allocator, raw_content);
-    return ToolResult{ .success = true, .output = content };
+    return ToolResult.owned(true, content);
 }
 
 // ── tool: file_write ──────────────────────────────────────────────────────────
@@ -113,17 +128,17 @@ fn toolFileRead(ctx: *ToolContext, args_json: []const u8) !ToolResult {
 fn toolFileWrite(ctx: *ToolContext, args_json: []const u8) !ToolResult {
     // Expected: {"path":"...","content":"..."}
     const parsed = std.json.parseFromSlice(std.json.Value, ctx.allocator, args_json, .{}) catch {
-        return ToolResult{ .success = false, .output = "invalid JSON in file_write args" };
+        return ToolResult.literal(false, "invalid JSON in file_write args");
     };
     defer parsed.deinit();
 
     const path = getString(parsed.value, "path") orelse {
-        return ToolResult{ .success = false, .output = "file_write: missing 'path' argument" };
+        return ToolResult.literal(false, "file_write: missing 'path' argument");
     };
     const content = getString(parsed.value, "content") orelse "";
 
     if (!ctx.policy.allowPath(path)) {
-        return ToolResult{ .success = false, .output = "file_write: path outside workspace is not allowed" };
+        return ToolResult.literal(false, "file_write: path outside workspace is not allowed");
     }
 
     ctx.policy.auditLog("file_write", path) catch {};
@@ -136,17 +151,17 @@ fn toolFileWrite(ctx: *ToolContext, args_json: []const u8) !ToolResult {
 
     var file = std.fs.cwd().createFile(path, .{ .truncate = true }) catch |err| {
         const msg = try std.fmt.allocPrint(ctx.allocator, "file_write: cannot create '{s}': {}", .{ path, err });
-        return ToolResult{ .success = false, .output = msg };
+        return ToolResult.owned(false, msg);
     };
     defer file.close();
 
     file.writeAll(content) catch |err| {
         const msg = try std.fmt.allocPrint(ctx.allocator, "file_write: write error: {}", .{err});
-        return ToolResult{ .success = false, .output = msg };
+        return ToolResult.owned(false, msg);
     };
 
     const msg = try std.fmt.allocPrint(ctx.allocator, "wrote {d} bytes to {s}", .{ content.len, path });
-    return ToolResult{ .success = true, .output = msg };
+    return ToolResult.owned(true, msg);
 }
 
 // ── tool: memory_store ────────────────────────────────────────────────────────
@@ -154,7 +169,7 @@ fn toolFileWrite(ctx: *ToolContext, args_json: []const u8) !ToolResult {
 fn toolMemoryStore(ctx: *ToolContext, args_json: []const u8) !ToolResult {
     // Expected: {"key":"...","content":"..."}
     const parsed = std.json.parseFromSlice(std.json.Value, ctx.allocator, args_json, .{}) catch {
-        return ToolResult{ .success = false, .output = "invalid JSON in memory_store args" };
+        return ToolResult.literal(false, "invalid JSON in memory_store args");
     };
     defer parsed.deinit();
 
@@ -163,7 +178,7 @@ fn toolMemoryStore(ctx: *ToolContext, args_json: []const u8) !ToolResult {
 
     try ctx.memory.store(key, content);
     ctx.policy.auditLog("memory_store", key) catch {};
-    return ToolResult{ .success = true, .output = "stored" };
+    return ToolResult.literal(true, "stored");
 }
 
 // ── tool: memory_recall ───────────────────────────────────────────────────────
@@ -171,7 +186,7 @@ fn toolMemoryStore(ctx: *ToolContext, args_json: []const u8) !ToolResult {
 fn toolMemoryRecall(ctx: *ToolContext, args_json: []const u8) !ToolResult {
     // Expected: {"key":"..."}
     const parsed = std.json.parseFromSlice(std.json.Value, ctx.allocator, args_json, .{}) catch {
-        return ToolResult{ .success = false, .output = "invalid JSON in memory_recall args" };
+        return ToolResult.literal(false, "invalid JSON in memory_recall args");
     };
     defer parsed.deinit();
 
@@ -181,10 +196,10 @@ fn toolMemoryRecall(ctx: *ToolContext, args_json: []const u8) !ToolResult {
 
     const content = ctx.memory.recall(key) catch |err| {
         const msg = try std.fmt.allocPrint(ctx.allocator, "memory_recall error: {}", .{err});
-        return ToolResult{ .success = false, .output = msg };
+        return ToolResult.owned(false, msg);
     };
 
-    return ToolResult{ .success = true, .output = content };
+    return ToolResult.owned(true, content);
 }
 
 // ── tool: memory_forget ───────────────────────────────────────────────────────
@@ -192,7 +207,7 @@ fn toolMemoryRecall(ctx: *ToolContext, args_json: []const u8) !ToolResult {
 fn toolMemoryForget(ctx: *ToolContext, args_json: []const u8) !ToolResult {
     // Expected: {"key":"..."}
     const parsed = std.json.parseFromSlice(std.json.Value, ctx.allocator, args_json, .{}) catch {
-        return ToolResult{ .success = false, .output = "invalid JSON in memory_forget args" };
+        return ToolResult.literal(false, "invalid JSON in memory_forget args");
     };
     defer parsed.deinit();
 
@@ -202,11 +217,11 @@ fn toolMemoryForget(ctx: *ToolContext, args_json: []const u8) !ToolResult {
 
     ctx.memory.forget(key) catch |err| {
         const msg = try std.fmt.allocPrint(ctx.allocator, "memory_forget error: {}", .{err});
-        return ToolResult{ .success = false, .output = msg };
+        return ToolResult.owned(false, msg);
     };
 
     const msg = try std.fmt.allocPrint(ctx.allocator, "forgot '{s}'", .{key});
-    return ToolResult{ .success = true, .output = msg };
+    return ToolResult.owned(true, msg);
 }
 
 // ── tool: http_request ────────────────────────────────────────────────────────
@@ -215,12 +230,12 @@ fn toolHttpRequest(ctx: *ToolContext, args_json: []const u8) !ToolResult {
     // Expected: {"url":"...","method":"GET|POST","body":"...","headers":{}}
     // Only GET and POST are supported for now.
     const parsed = std.json.parseFromSlice(std.json.Value, ctx.allocator, args_json, .{}) catch {
-        return ToolResult{ .success = false, .output = "invalid JSON in http_request args" };
+        return ToolResult.literal(false, "invalid JSON in http_request args");
     };
     defer parsed.deinit();
 
     const url_str = getString(parsed.value, "url") orelse {
-        return ToolResult{ .success = false, .output = "http_request: missing 'url' argument" };
+        return ToolResult.literal(false, "http_request: missing 'url' argument");
     };
     const method_str = getString(parsed.value, "method") orelse "GET";
     const body_str = getString(parsed.value, "body") orelse "";
@@ -229,7 +244,7 @@ fn toolHttpRequest(ctx: *ToolContext, args_json: []const u8) !ToolResult {
 
     const uri = std.Uri.parse(url_str) catch {
         const msg = try std.fmt.allocPrint(ctx.allocator, "http_request: invalid URL '{s}'", .{url_str});
-        return ToolResult{ .success = false, .output = msg };
+        return ToolResult.owned(false, msg);
     };
 
     const method: std.http.Method = if (std.mem.eql(u8, method_str, "POST"))
@@ -252,7 +267,7 @@ fn toolHttpRequest(ctx: *ToolContext, args_json: []const u8) !ToolResult {
         .response_storage = .{ .dynamic = &response_buf },
     }) catch |err| {
         const msg = try std.fmt.allocPrint(ctx.allocator, "http_request failed: {}", .{err});
-        return ToolResult{ .success = false, .output = msg };
+        return ToolResult.owned(false, msg);
     };
 
     const success = @intFromEnum(result.status) < 400;
@@ -265,10 +280,10 @@ fn toolHttpRequest(ctx: *ToolContext, args_json: []const u8) !ToolResult {
             .{ @intFromEnum(result.status), output },
         );
         ctx.allocator.free(output);
-        return ToolResult{ .success = false, .output = msg };
+        return ToolResult.owned(false, msg);
     }
 
-    return ToolResult{ .success = true, .output = output };
+    return ToolResult.owned(true, output);
 }
 
 // ── T1-2: Tool output size cap ────────────────────────────────────────────────
@@ -298,7 +313,7 @@ fn toolGitOperations(ctx: *ToolContext, args_json: []const u8) !ToolResult {
     //           each argument is passed as a separate argv element — NO shell
     //           interpolation, so metacharacters are safe)
     const parsed = std.json.parseFromSlice(std.json.Value, ctx.allocator, args_json, .{}) catch {
-        return ToolResult{ .success = false, .output = "invalid JSON in git_operations args" };
+        return ToolResult.literal(false, "invalid JSON in git_operations args");
     };
     defer parsed.deinit();
 
@@ -316,12 +331,12 @@ fn toolGitOperations(ctx: *ToolContext, args_json: []const u8) !ToolResult {
         if (std.mem.eql(u8, op, allowed)) { op_ok = true; break; }
     }
     if (!op_ok) {
-        return ToolResult{ .success = false, .output = "git_operations: unsupported operation" };
+        return ToolResult.literal(false, "git_operations: unsupported operation");
     }
 
     // Validate path.
     if (!ctx.policy.allowPath(path)) {
-        return ToolResult{ .success = false, .output = "git_operations: path outside workspace" };
+        return ToolResult.literal(false, "git_operations: path outside workspace");
     }
 
     ctx.policy.auditLog("git_operations", op) catch {};
@@ -349,17 +364,14 @@ fn toolGitOperations(ctx: *ToolContext, args_json: []const u8) !ToolResult {
         .argv      = argv.items,
     }) catch |err| {
         const msg = try std.fmt.allocPrint(ctx.allocator, "git exec failed: {}", .{err});
-        return ToolResult{ .success = false, .output = msg };
+        return ToolResult.owned(false, msg);
     };
     defer ctx.allocator.free(result.stdout);
     defer ctx.allocator.free(result.stderr);
 
     const raw = if (result.stdout.len > 0) result.stdout else result.stderr;
     const output = try capOutput(ctx.allocator, raw);
-    return ToolResult{
-        .success = result.term == .Exited and result.term.Exited == 0,
-        .output  = output,
-    };
+    return ToolResult.owned(result.term == .Exited and result.term.Exited == 0, output);
 }
 
 // ── T2-6: memory_list_keys ───────────────────────────────────────────────────
@@ -371,7 +383,7 @@ fn toolMemoryListKeys(ctx: *ToolContext, _: []const u8) !ToolResult {
     defer ctx.allocator.free(mem_dir);
 
     var dir = std.fs.cwd().openDir(mem_dir, .{ .iterate = true }) catch {
-        return ToolResult{ .success = true, .output = try ctx.allocator.dupe(u8, "(no memory directory yet)") };
+        return ToolResult.owned(true, try ctx.allocator.dupe(u8, "(no memory directory yet)"));
     };
     defer dir.close();
 
@@ -393,21 +405,21 @@ fn toolMemoryListKeys(ctx: *ToolContext, _: []const u8) !ToolResult {
 
     if (count == 0) {
         out.deinit();
-        return ToolResult{ .success = true, .output = try ctx.allocator.dupe(u8, "(no memory entries)") };
+        return ToolResult.owned(true, try ctx.allocator.dupe(u8, "(no memory entries)"));
     }
-    return ToolResult{ .success = true, .output = try out.toOwnedSlice() };
+    return ToolResult.owned(true, try out.toOwnedSlice());
 }
 
 // ── T2-6: memory_delete_prefix ───────────────────────────────────────────────
 
 fn toolMemoryDeletePrefix(ctx: *ToolContext, args_json: []const u8) !ToolResult {
     const parsed = std.json.parseFromSlice(std.json.Value, ctx.allocator, args_json, .{}) catch {
-        return ToolResult{ .success = false, .output = "invalid JSON in memory_delete_prefix args" };
+        return ToolResult.literal(false, "invalid JSON in memory_delete_prefix args");
     };
     defer parsed.deinit();
 
     const prefix = getString(parsed.value, "prefix") orelse {
-        return ToolResult{ .success = false, .output = "memory_delete_prefix: missing 'prefix' argument" };
+        return ToolResult.literal(false, "memory_delete_prefix: missing 'prefix' argument");
     };
 
     ctx.policy.auditLog("memory_delete_prefix", prefix) catch {};
@@ -416,7 +428,7 @@ fn toolMemoryDeletePrefix(ctx: *ToolContext, args_json: []const u8) !ToolResult 
     defer ctx.allocator.free(mem_dir_path);
 
     var dir = std.fs.cwd().openDir(mem_dir_path, .{ .iterate = true }) catch {
-        return ToolResult{ .success = true, .output = try ctx.allocator.dupe(u8, "deleted 0 entries") };
+        return ToolResult.owned(true, try ctx.allocator.dupe(u8, "deleted 0 entries"));
     };
     defer dir.close();
 
@@ -444,7 +456,7 @@ fn toolMemoryDeletePrefix(ctx: *ToolContext, args_json: []const u8) !ToolResult 
     }
 
     const msg = try std.fmt.allocPrint(ctx.allocator, "deleted {d} memory entries with prefix '{s}'", .{ deleted, prefix });
-    return ToolResult{ .success = true, .output = msg };
+    return ToolResult.owned(true, msg);
 }
 
 // ── T2-7: agent_status ───────────────────────────────────────────────────────
@@ -471,14 +483,14 @@ fn toolAgentStatus(ctx: *ToolContext, _: []const u8) !ToolResult {
         "workspace: {s}\nmemory_entries: {d}\npolicy: workspace-only sandbox",
         .{ ctx.policy.workspace_dir, mem_count },
     );
-    return ToolResult{ .success = true, .output = out };
+    return ToolResult.owned(true, out);
 }
 
 // ── T2-7: audit_log_read ─────────────────────────────────────────────────────
 
 fn toolAuditLogRead(ctx: *ToolContext, args_json: []const u8) !ToolResult {
     const parsed = std.json.parseFromSlice(std.json.Value, ctx.allocator, args_json, .{}) catch {
-        return ToolResult{ .success = false, .output = "invalid JSON in audit_log_read args" };
+        return ToolResult.literal(false, "invalid JSON in audit_log_read args");
     };
     defer parsed.deinit();
 
@@ -497,12 +509,12 @@ fn toolAuditLogRead(ctx: *ToolContext, args_json: []const u8) !ToolResult {
     defer ctx.allocator.free(log_path);
 
     const file = std.fs.cwd().openFile(log_path, .{}) catch {
-        return ToolResult{ .success = true, .output = try ctx.allocator.dupe(u8, "(audit log empty or not yet created)") };
+        return ToolResult.owned(true, try ctx.allocator.dupe(u8, "(audit log empty or not yet created)"));
     };
     defer file.close();
 
     const raw = file.readToEndAlloc(ctx.allocator, 4 * 1024 * 1024) catch {
-        return ToolResult{ .success = false, .output = try ctx.allocator.dupe(u8, "audit_log_read: read error") };
+        return ToolResult.owned(false, try ctx.allocator.dupe(u8, "audit_log_read: read error"));
     };
     defer ctx.allocator.free(raw);
 
@@ -525,9 +537,9 @@ fn toolAuditLogRead(ctx: *ToolContext, args_json: []const u8) !ToolResult {
 
     if (out.items.len == 0) {
         out.deinit();
-        return ToolResult{ .success = true, .output = try ctx.allocator.dupe(u8, "(no audit entries)") };
+        return ToolResult.owned(true, try ctx.allocator.dupe(u8, "(no audit entries)"));
     }
-    return ToolResult{ .success = true, .output = try capOutput(ctx.allocator, out.items) };
+    return ToolResult.owned(true, try capOutput(ctx.allocator, out.items));
 }
 
 // ── registry ──────────────────────────────────────────────────────────────────
@@ -588,7 +600,7 @@ pub const McpProxyMeta = struct {
 /// Reads user_data as *McpProxyMeta to know which server and tool to call.
 fn toolMcpProxy(ctx: *ToolContext, args_json: []const u8) !ToolResult {
     const pool = ctx.mcp_pool orelse {
-        return ToolResult{ .success = false, .output = "mcp: no session pool in context" };
+        return ToolResult.literal(false, "mcp: no session pool in context");
     };
     // user_data is set by buildMcpTools to point at the McpProxyMeta for this tool.
     // The caller (agent.zig) passes &ctx with the correct tool's user_data already wired in.
@@ -603,22 +615,22 @@ fn toolMcpProxy(ctx: *ToolContext, args_json: []const u8) !ToolResult {
     // Simpler: we accept that ctx needs one more field for MCP tool dispatch.
     // Add mcp_current_meta to ToolContext temporarily, set by dispatchAllToolCalls.
     const meta: *McpProxyMeta = @ptrCast(@alignCast(ctx.mcp_current_meta orelse {
-        return ToolResult{ .success = false, .output = "mcp: missing tool metadata in context" };
+        return ToolResult.literal(false, "mcp: missing tool metadata in context");
     }));
 
     ctx.policy.auditLog("mcp_tool", meta.mcp_tool_name) catch {};
 
     const session = pool.getOrStart(meta.server_argv) catch |err| {
         const msg = try std.fmt.allocPrint(ctx.allocator, "mcp: failed to start server: {}", .{err});
-        return ToolResult{ .success = false, .output = msg };
+        return ToolResult.owned(false, msg);
     };
 
     const result = session.callTool(meta.mcp_tool_name, args_json) catch |err| {
         const msg = try std.fmt.allocPrint(ctx.allocator, "mcp: call failed: {}", .{err});
-        return ToolResult{ .success = false, .output = msg };
+        return ToolResult.owned(false, msg);
     };
 
-    return ToolResult{ .success = true, .output = result };
+    return ToolResult.owned(true, result);
 }
 
 // T1-5: MCP startup error reporting ──────────────────────────────────────────
