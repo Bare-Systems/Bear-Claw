@@ -404,6 +404,20 @@ fn discordGatewayLoop(
     var bot_id: []u8 = try allocator.dupe(u8, "");
     defer allocator.free(bot_id);
 
+    // Per-channel conversation history.
+    // Keyed by channel_id string (owned). Each value is a ConversationHistory
+    // that accumulates turns so Bear has context across messages in the same
+    // channel or DM thread.
+    var channel_histories = std.StringHashMap(agent_mod.ConversationHistory).init(allocator);
+    defer {
+        var it = channel_histories.iterator();
+        while (it.next()) |entry| {
+            allocator.free(entry.key_ptr.*);
+            entry.value_ptr.deinit();
+        }
+        channel_histories.deinit();
+    }
+
     while (true) {
         const now = std.time.milliTimestamp();
         if (now - last_heartbeat >= @as(i64, @intCast(heartbeat_interval_ms))) {
@@ -611,12 +625,31 @@ fn discordGatewayLoop(
                     try stdout.print("Discord [{s}] {s}: {s}\n", .{ channel_id, author_name, content });
                     try stdout.print("Discord: generating reply...\n", .{});
 
-                    const reply = agent_mod.runAgentOnceCaptured(
+                    // Look up (or create) the ConversationHistory for this channel.
+                    // This gives Bear multi-turn context within the same channel/DM.
+                    const history_entry = try channel_histories.getOrPut(channel_id);
+                    if (!history_entry.found_existing) {
+                        // New channel — own a copy of the key and initialise history.
+                        history_entry.key_ptr.* = try allocator.dupe(u8, channel_id);
+                        history_entry.value_ptr.* = agent_mod.ConversationHistory.init(allocator);
+                    }
+                    const history = history_entry.value_ptr;
+
+                    // Capture reply into a buffer so we can send it to Discord.
+                    var reply_buf = std.ArrayList(u8).init(allocator);
+                    errdefer reply_buf.deinit();
+                    var reply_writer = reply_buf.writer();
+
+                    agent_mod.runAgentWithHistory(
                         allocator, cfg, any_provider,
-                        memory, tools, policy, mcp_pool, content,
-                    ) catch |err| blk: {
-                        break :blk try std.fmt.allocPrint(allocator, "error: {}", .{err});
+                        memory, tools, policy, mcp_pool,
+                        content, history, &reply_writer,
+                    ) catch |err| {
+                        reply_buf.clearRetainingCapacity();
+                        try reply_buf.writer().print("error: {}", .{err});
                     };
+
+                    const reply = try reply_buf.toOwnedSlice();
                     defer allocator.free(reply);
 
                     try stdout.print("Discord: sending reply: {s}\n", .{reply});
