@@ -500,8 +500,23 @@ fn discordGatewayLoop(
                     const channel_id = switch (channel_id_val) { .string => |s| s, else => continue };
                     if (content_raw.len == 0) continue;
 
-                    if (debug) try stdout.print("[DEBUG] MESSAGE_CREATE ch={s} content=\"{s}\"\n",
-                        .{ channel_id, if (content_raw.len > 100) content_raw[0..100] else content_raw });
+                    // Detect Direct Messages:
+                    //   Discord DMs have no guild_id field (or it is null/missing).
+                    //   channel_type == 1 also signals a DM channel.
+                    //   In a DM the bot should always respond — no @mention required.
+                    const is_dm = blk: {
+                        // guild_id absent → DM
+                        const gid = d.object.get("guild_id");
+                        if (gid == null or gid.? == .null) break :blk true;
+                        // channel_type == 1 → DM channel
+                        if (d.object.get("channel_type")) |ct| {
+                            if (ct == .integer and ct.integer == 1) break :blk true;
+                        }
+                        break :blk false;
+                    };
+
+                    if (debug) try stdout.print("[DEBUG] MESSAGE_CREATE ch={s} is_dm={} content=\"{s}\"\n",
+                        .{ channel_id, is_dm, if (content_raw.len > 100) content_raw[0..100] else content_raw });
 
                     // Determine whether the bot was mentioned. Discord sends
                     // three kinds of mentions we want to catch:
@@ -522,7 +537,7 @@ fn discordGatewayLoop(
                     const mention_nick   = try std.fmt.allocPrint(allocator, "<@!{s}>", .{bot_id});
                     defer allocator.free(mention_nick);
 
-                    const is_mentioned = detect: {
+                    const is_mentioned = is_dm or detect: {
                         if (bot_id.len == 0) break :detect true; // READY not yet received
 
                         // 1. Check d.mentions[] for the bot's user ID.
@@ -556,12 +571,12 @@ fn discordGatewayLoop(
                     };
 
                     if (debug) try stdout.print(
-                        "[DEBUG] bot_id=\"{s}\" is_mentioned={}\n",
-                        .{ bot_id, is_mentioned },
+                        "[DEBUG] bot_id=\"{s}\" is_dm={} is_mentioned={}\n",
+                        .{ bot_id, is_dm, is_mentioned },
                     );
 
-                    // If we have a bot_id and are not mentioned, skip.
-                    // If bot_id is empty (READY not yet received), respond to everything.
+                    // In a guild channel: only respond when mentioned.
+                    // In a DM: always respond (is_mentioned == true from the is_dm shortcut above).
                     if (!is_mentioned) {
                         if (debug) try stdout.print("[DEBUG] Not mentioned — skipping message.\n", .{});
                         continue;
