@@ -575,6 +575,60 @@ fn toolAuditLogRead(ctx: *ToolContext, args_json: []const u8) !ToolResult {
     return ToolResult.owned(true, try capOutput(ctx.allocator, out.items));
 }
 
+// ── cron tools ────────────────────────────────────────────────────────────────
+//
+// Native built-in tools for Bear to manage its own cron scheduler.
+// These shell out to `bareclaw cron` subcommands so they are always available
+// without requiring an external MCP server.
+
+/// List all scheduled cron tasks.
+fn toolCronList(ctx: *ToolContext, _: []const u8) !ToolResult {
+    ctx.policy.auditLog("cron_list", "") catch {};
+    return runShellCmd(ctx, "bareclaw cron list");
+}
+
+/// Add an agent-prompt cron task.
+/// Args: {"schedule": "0 9 * * *", "prompt": "Summarise portfolio"}
+fn toolCronAddPrompt(ctx: *ToolContext, args_json: []const u8) !ToolResult {
+    const parsed = std.json.parseFromSlice(std.json.Value, ctx.allocator, args_json, .{}) catch
+        return ToolResult.literal(false, "cron_add_prompt: invalid JSON args");
+    defer parsed.deinit();
+
+    const schedule = getString(parsed.value, "schedule") orelse
+        return ToolResult.literal(false, "cron_add_prompt: missing 'schedule' field");
+    const prompt = getString(parsed.value, "prompt") orelse
+        return ToolResult.literal(false, "cron_add_prompt: missing 'prompt' field");
+
+    ctx.policy.auditLog("cron_add_prompt", schedule) catch {};
+
+    // Shell out: bareclaw cron add-prompt "<schedule>" "<prompt>"
+    // We build the command string safely — single-quote each arg to prevent injection.
+    const cmd = try std.fmt.allocPrint(
+        ctx.allocator,
+        "bareclaw cron add-prompt '{s}' '{s}'",
+        .{ schedule, prompt },
+    );
+    defer ctx.allocator.free(cmd);
+    return runShellCmd(ctx, cmd);
+}
+
+/// Remove a cron task by ID.
+/// Args: {"id": "t1"}
+fn toolCronRemove(ctx: *ToolContext, args_json: []const u8) !ToolResult {
+    const parsed = std.json.parseFromSlice(std.json.Value, ctx.allocator, args_json, .{}) catch
+        return ToolResult.literal(false, "cron_remove: invalid JSON args");
+    defer parsed.deinit();
+
+    const id = getString(parsed.value, "id") orelse
+        return ToolResult.literal(false, "cron_remove: missing 'id' field");
+
+    ctx.policy.auditLog("cron_remove", id) catch {};
+
+    const cmd = try std.fmt.allocPrint(ctx.allocator, "bareclaw cron remove {s}", .{id});
+    defer ctx.allocator.free(cmd);
+    return runShellCmd(ctx, cmd);
+}
+
 // ── registry ──────────────────────────────────────────────────────────────────
 
 pub fn buildCoreTools(
@@ -597,6 +651,9 @@ pub fn buildCoreTools(
     try list.append(Tool{ .name = "git_operations",       .description = "Run a git subcommand in the workspace",                 .executeFn = toolGitOperations });
     try list.append(Tool{ .name = "agent_status",         .description = "Return agent runtime status (workspace, memory count)", .executeFn = toolAgentStatus });
     try list.append(Tool{ .name = "audit_log_read",       .description = "Read the last N lines of the audit log",               .executeFn = toolAuditLogRead });
+    try list.append(Tool{ .name = "cron_list",            .description = "List all scheduled cron tasks",                        .executeFn = toolCronList });
+    try list.append(Tool{ .name = "cron_add_prompt",      .description = "Schedule a recurring agent-prompt task. Args: {\"schedule\":\"0 9 * * *\",\"prompt\":\"your prompt here\"}", .executeFn = toolCronAddPrompt });
+    try list.append(Tool{ .name = "cron_remove",          .description = "Remove a cron task by ID. Args: {\"id\":\"t1\"}",      .executeFn = toolCronRemove });
 
     return list.toOwnedSlice();
 }
