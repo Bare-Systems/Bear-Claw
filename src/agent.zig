@@ -218,8 +218,13 @@ fn runAgentOnceToWriter(
         // workspace work, and what each tool does — so it can answer questions
         // about itself accurately instead of hallucinating.
         try sw.writeAll(
-            "You are Bear, an autonomous AI agent built on BareClaw — a lightweight, " ++
-            "zero-dependency agent runtime written in Zig. You run locally on the user's machine.\n\n"
+            "You are Bear, an autonomous AI agent running locally on the user's machine.\n\n" ++
+            "CRITICAL RULES (always follow these, no exceptions):\n" ++
+            "1. You HAVE real filesystem access via the `shell` tool. NEVER say you lack access.\n" ++
+            "   When asked about files or directories: use the shell tool. Always. No excuses.\n" ++
+            "2. To use a tool: output ONLY this JSON, nothing else, no prose, no fences:\n" ++
+            "   {\"tool_calls\":[{\"function\":\"shell\",\"arguments\":{\"command\":\"ls ~/Downloads\"}}]}\n" ++
+            "3. After getting tool results, give a plain text answer. No more JSON.\n\n"
         );
 
         try sw.print(
@@ -325,9 +330,13 @@ fn runAgentOnceToWriter(
     if (tools.len > 0) {
         try sw.writeAll(
             "## Tools\n" ++
-            "When you need to use a tool, respond with ONLY a JSON object in this exact format\n" ++
-            "(no markdown fences, no prose before or after the JSON):\n" ++
-            "{\"tool_calls\":[{\"function\":\"TOOL_NAME\",\"arguments\":{}}]}\n\n" ++
+            "When you need to use a tool, respond with ONLY a JSON object in this EXACT format.\n" ++
+            "Do not add prose, markdown fences, or any text outside the JSON:\n" ++
+            "{\"tool_calls\":[{\"function\":\"TOOL_NAME\",\"arguments\":{\"key\":\"value\"}}]}\n\n" ++
+            "Example — run a shell command:\n" ++
+            "{\"tool_calls\":[{\"function\":\"shell\",\"arguments\":{\"command\":\"ls ~/Downloads\"}}]}\n\n" ++
+            "Example — recall a memory key:\n" ++
+            "{\"tool_calls\":[{\"function\":\"memory_recall\",\"arguments\":{\"key\":\"notes/ideas\"}}]}\n\n" ++
             "Available tools:\n",
         );
         for (tools) |tool| {
@@ -485,6 +494,62 @@ fn dispatchAllToolCalls(
     const parsed = std.json.parseFromSlice(std.json.Value, allocator, response_json, .{}) catch
         return false;
     defer parsed.deinit();
+
+    // ── Bare-args fallback ────────────────────────────────────────────────────
+    // Some models (llama3.2, Ollama) emit only the arguments object without the
+    // tool_calls wrapper — e.g. {"command":"ls ~/Downloads"} instead of
+    // {"tool_calls":[{"function":"shell","arguments":{"command":"ls ~/Downloads"}}]}
+    //
+    // When we see no "tool_calls" key, try to infer the intended tool from the
+    // top-level keys. Known inference rules (first match wins):
+    //   "command" | "cmd"    → shell
+    //   "key" + "value"      → memory_store
+    //   "key"                → memory_recall
+    //   "path"               → file_read
+    //   "path" + "content"   → file_write
+    if (parsed.value.object.get("tool_calls") == null) {
+        const obj = parsed.value.object;
+        const inferred_name: ?[]const u8 = blk: {
+            if (obj.get("command") != null or obj.get("cmd") != null) break :blk "shell";
+            if (obj.get("key") != null and obj.get("value") != null) break :blk "memory_store";
+            if (obj.get("key") != null) break :blk "memory_recall";
+            if (obj.get("path") != null and obj.get("content") != null) break :blk "file_write";
+            if (obj.get("path") != null) break :blk "file_read";
+            break :blk null;
+        };
+        if (inferred_name) |name| {
+            // Re-serialize the whole object as the args JSON string.
+            var args_buf = std.ArrayList(u8).init(allocator);
+            defer args_buf.deinit();
+            try std.json.stringify(parsed.value, .{}, args_buf.writer());
+            const args_json = args_buf.items;
+
+            var ctx2 = tools_mod.ToolContext{
+                .allocator = allocator,
+                .policy    = policy,
+                .memory    = memory,
+                .mcp_pool  = mcp_pool,
+            };
+            for (tools) |tool| {
+                if (!std.mem.eql(u8, tool.name, name)) continue;
+                ctx2.mcp_current_meta = tool.user_data;
+                const result = tool.executeFn(&ctx2, args_json) catch |err| blk: {
+                    const msg = try std.fmt.allocPrint(allocator, "tool error: {}", .{err});
+                    break :blk tools_mod.ToolResult.owned(false, msg);
+                };
+                defer if (result.allocated) allocator.free(result.output);
+                const entry = try std.fmt.allocPrint(
+                    allocator, "[{s}] {s}: {s}\n",
+                    .{ if (result.success) @as([]const u8, "ok") else "error", name, result.output },
+                );
+                defer allocator.free(entry);
+                try context.appendSlice(entry);
+                break;
+            }
+            return true;
+        }
+        return false;
+    }
 
     const tool_calls_val = parsed.value.object.get("tool_calls") orelse return false;
     const tool_calls = switch (tool_calls_val) {
