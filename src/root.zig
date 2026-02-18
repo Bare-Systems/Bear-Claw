@@ -180,6 +180,7 @@ test "buildCoreTools: all expected tools are present" {
         .discord_webhook    = "",
         .telegram_token     = "",
         .mcp_servers        = "",
+        .system_prompt      = "",
     };
 
     var policy = security_mod.SecurityPolicy.initWorkspaceOnly(std.testing.allocator, &cfg);

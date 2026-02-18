@@ -26,6 +26,11 @@ pub const Config = struct {
     /// Example: "autotrader=trader mcp serve|mybot=python bot.py"
     mcp_servers: []const u8,
 
+    /// Optional custom system prompt override.
+    /// Empty string (default) means: use the built-in factual system prompt.
+    /// Set via `bareclaw config set system_prompt "..."` or in config.toml.
+    system_prompt: []const u8,
+
     pub fn deinit(self: *Config, allocator: std.mem.Allocator) void {
         allocator.free(self.workspace_dir);
         allocator.free(self.config_path);
@@ -38,6 +43,7 @@ pub const Config = struct {
         allocator.free(self.discord_webhook);
         allocator.free(self.telegram_token);
         allocator.free(self.mcp_servers);
+        allocator.free(self.system_prompt);
         self.* = undefined;
     }
 
@@ -58,13 +64,17 @@ pub const Config = struct {
             "telegram_token  = \"{s}\"\n" ++
             "\n" ++
             "# MCP servers (pipe-separated: name=command arg1 arg2...)\n" ++
-            "mcp_servers = \"{s}\"\n",
+            "mcp_servers = \"{s}\"\n" ++
+            "\n" ++
+            "# Custom system prompt (leave empty to use built-in default)\n" ++
+            "system_prompt = \"{s}\"\n",
             .{
                 self.default_provider, self.default_model,
                 self.memory_backend,   self.fallback_providers,
                 self.api_key,
                 self.discord_token,    self.discord_webhook,  self.telegram_token,
                 self.mcp_servers,
+                self.system_prompt,
             },
         );
     }
@@ -75,7 +85,7 @@ pub const Config = struct {
         const known_keys = [_][]const u8{
             "default_provider", "default_model", "memory_backend",
             "fallback_providers", "api_key", "discord_token", "discord_webhook", "telegram_token",
-            "mcp_servers",
+            "mcp_servers", "system_prompt",
         };
         var found = false;
         for (known_keys) |k| {
@@ -84,7 +94,7 @@ pub const Config = struct {
         if (!found) {
             return try std.fmt.allocPrint(
                 allocator,
-                "Unknown config key: \"{s}\"\nValid keys: default_provider, default_model, memory_backend, fallback_providers, api_key, discord_token, discord_webhook, telegram_token, mcp_servers",
+                "Unknown config key: \"{s}\"\nValid keys: default_provider, default_model, memory_backend, fallback_providers, api_key, discord_token, discord_webhook, telegram_token, mcp_servers, system_prompt",
                 .{key},
             );
         }
@@ -118,6 +128,9 @@ pub const Config = struct {
         } else if (std.mem.eql(u8, key, "mcp_servers")) {
             allocator.free(self.mcp_servers);
             self.mcp_servers = duped;
+        } else if (std.mem.eql(u8, key, "system_prompt")) {
+            allocator.free(self.system_prompt);
+            self.system_prompt = duped;
         } else {
             allocator.free(duped);
         }
@@ -155,6 +168,7 @@ pub fn loadOrInit(allocator: std.mem.Allocator) !Config {
         .discord_webhook    = try allocator.dupe(u8, ""),
         .telegram_token     = try allocator.dupe(u8, ""),
         .mcp_servers        = try allocator.dupe(u8, ""),
+        .system_prompt      = try allocator.dupe(u8, ""),
     };
 
     // Best-effort: parse existing config.toml for a few keys.
@@ -221,6 +235,11 @@ fn parseSimpleToml(cfg: *Config, contents: []u8, allocator: std.mem.Allocator) !
             if (parseValue(line)) |val| {
                 allocator.free(cfg.mcp_servers);
                 cfg.mcp_servers = try allocator.dupe(u8, val);
+            }
+        } else if (std.mem.startsWith(u8, line, "system_prompt")) {
+            if (parseValue(line)) |val| {
+                allocator.free(cfg.system_prompt);
+                cfg.system_prompt = try allocator.dupe(u8, val);
             }
         }
     }
