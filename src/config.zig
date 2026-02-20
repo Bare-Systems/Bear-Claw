@@ -18,6 +18,10 @@ pub const Config = struct {
     discord_token: []const u8,
     /// Discord webhook URL for integration testing (optional)
     discord_webhook: []const u8,
+    /// Discord channel ID to send proactive notifications to (e.g. cron reports).
+    /// Set to the DM channel ID or any channel ID the bot has access to.
+    /// Set via: bareclaw config set discord_notify_channel "1473668167397019823"
+    discord_notify_channel: []const u8,
     /// Telegram bot token (optional)
     telegram_token: []const u8,
 
@@ -48,6 +52,7 @@ pub const Config = struct {
         allocator.free(self.api_key);
         allocator.free(self.discord_token);
         allocator.free(self.discord_webhook);
+        allocator.free(self.discord_notify_channel);
         allocator.free(self.telegram_token);
         allocator.free(self.mcp_servers);
         allocator.free(self.system_prompt);
@@ -67,9 +72,12 @@ pub const Config = struct {
             "api_key            = \"{s}\"\n" ++
             "\n" ++
             "# Channel tokens\n" ++
-            "discord_token   = \"{s}\"\n" ++
-            "discord_webhook = \"{s}\"\n" ++
-            "telegram_token  = \"{s}\"\n" ++
+            "discord_token          = \"{s}\"\n" ++
+            "discord_webhook        = \"{s}\"\n" ++
+            "# Channel ID for proactive notifications (cron reports, alerts)\n" ++
+            "# Set to your DM channel ID with Bear, or any channel Bear has access to.\n" ++
+            "discord_notify_channel = \"{s}\"\n" ++
+            "telegram_token         = \"{s}\"\n" ++
             "\n" ++
             "# MCP servers (pipe-separated: name=command arg1 arg2...)\n" ++
             "mcp_servers = \"{s}\"\n" ++
@@ -84,7 +92,7 @@ pub const Config = struct {
                 self.default_provider, self.default_model,
                 self.memory_backend,   self.fallback_providers,
                 self.api_key,
-                self.discord_token,    self.discord_webhook,  self.telegram_token,
+                self.discord_token,    self.discord_webhook,  self.discord_notify_channel,  self.telegram_token,
                 self.mcp_servers,
                 self.system_prompt,
                 self.allowed_paths,
@@ -97,7 +105,8 @@ pub const Config = struct {
     pub fn setKey(self: *Config, allocator: std.mem.Allocator, key: []const u8, value: []const u8) !?[]u8 {
         const known_keys = [_][]const u8{
             "default_provider", "default_model", "memory_backend",
-            "fallback_providers", "api_key", "discord_token", "discord_webhook", "telegram_token",
+            "fallback_providers", "api_key", "discord_token", "discord_webhook",
+            "discord_notify_channel", "telegram_token",
             "mcp_servers", "system_prompt", "allowed_paths",
         };
         var found = false;
@@ -107,7 +116,7 @@ pub const Config = struct {
         if (!found) {
             return try std.fmt.allocPrint(
                 allocator,
-                "Unknown config key: \"{s}\"\nValid keys: default_provider, default_model, memory_backend, fallback_providers, api_key, discord_token, discord_webhook, telegram_token, mcp_servers, system_prompt, allowed_paths",
+                "Unknown config key: \"{s}\"\nValid keys: default_provider, default_model, memory_backend, fallback_providers, api_key, discord_token, discord_webhook, discord_notify_channel, telegram_token, mcp_servers, system_prompt, allowed_paths",
                 .{key},
             );
         }
@@ -135,6 +144,9 @@ pub const Config = struct {
         } else if (std.mem.eql(u8, key, "discord_webhook")) {
             allocator.free(self.discord_webhook);
             self.discord_webhook = duped;
+        } else if (std.mem.eql(u8, key, "discord_notify_channel")) {
+            allocator.free(self.discord_notify_channel);
+            self.discord_notify_channel = duped;
         } else if (std.mem.eql(u8, key, "telegram_token")) {
             allocator.free(self.telegram_token);
             self.telegram_token = duped;
@@ -180,9 +192,10 @@ pub fn loadOrInit(allocator: std.mem.Allocator) !Config {
         .memory_backend     = try allocator.dupe(u8, "markdown"),
         .fallback_providers = try allocator.dupe(u8, ""),
         .api_key            = try allocator.dupe(u8, ""),
-        .discord_token      = try allocator.dupe(u8, ""),
-        .discord_webhook    = try allocator.dupe(u8, ""),
-        .telegram_token     = try allocator.dupe(u8, ""),
+        .discord_token          = try allocator.dupe(u8, ""),
+        .discord_webhook        = try allocator.dupe(u8, ""),
+        .discord_notify_channel = try allocator.dupe(u8, ""),
+        .telegram_token         = try allocator.dupe(u8, ""),
         .mcp_servers        = try allocator.dupe(u8, ""),
         .system_prompt      = try allocator.dupe(u8, ""),
         .allowed_paths      = try allocator.dupe(u8, ""),
@@ -232,6 +245,11 @@ fn parseSimpleToml(cfg: *Config, contents: []u8, allocator: std.mem.Allocator) !
             if (parseValue(line)) |val| {
                 allocator.free(cfg.api_key);
                 cfg.api_key = try allocator.dupe(u8, val);
+            }
+        } else if (std.mem.startsWith(u8, line, "discord_notify_channel")) {
+            if (parseValue(line)) |val| {
+                allocator.free(cfg.discord_notify_channel);
+                cfg.discord_notify_channel = try allocator.dupe(u8, val);
             }
         } else if (std.mem.startsWith(u8, line, "discord_webhook")) {
             if (parseValue(line)) |val| {

@@ -176,9 +176,10 @@ test "buildCoreTools: all expected tools are present" {
         .memory_backend     = "markdown",
         .fallback_providers = "",
         .api_key            = "",
-        .discord_token      = "",
-        .discord_webhook    = "",
-        .telegram_token     = "",
+        .discord_token          = "",
+        .discord_webhook        = "",
+        .discord_notify_channel = "",
+        .telegram_token         = "",
         .mcp_servers        = "",
         .system_prompt      = "",
         .allowed_paths      = "",
@@ -200,7 +201,7 @@ test "buildCoreTools: all expected tools are present" {
         "http_request", "git_operations",
         "agent_status", "audit_log_read",
         "discord_notify",
-        "cron_list", "cron_add_prompt", "cron_remove",
+        "cron_list", "cron_add_prompt", "cron_remove", "cron_run",
     };
 
     for (expected_tools) |expected| {
