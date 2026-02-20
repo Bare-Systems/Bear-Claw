@@ -199,6 +199,7 @@ test "buildCoreTools: all expected tools are present" {
         "memory_list_keys", "memory_delete_prefix",
         "http_request", "git_operations",
         "agent_status", "audit_log_read",
+        "discord_notify",
         "cron_list", "cron_add_prompt", "cron_remove",
     };
 

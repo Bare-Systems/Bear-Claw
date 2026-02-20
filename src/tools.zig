@@ -35,6 +35,7 @@ pub const ToolContext = struct {
     allocator: std.mem.Allocator,
     policy: *security_mod.SecurityPolicy,
     memory: *memory_mod.MemoryBackend,
+    cfg: *const @import("config.zig").Config,
     /// Optional MCP session pool, shared across all MCP proxy tool calls in a session.
     mcp_pool: ?*mcp_mod.McpSessionPool = null,
     /// Set by agent.zig dispatch loop to point at the current tool's McpProxyMeta
@@ -575,6 +576,79 @@ fn toolAuditLogRead(ctx: *ToolContext, args_json: []const u8) !ToolResult {
     return ToolResult.owned(true, try capOutput(ctx.allocator, out.items));
 }
 
+// ── tool: discord_notify ──────────────────────────────────────────────────────
+//
+// Posts a message to a Discord channel via the configured webhook URL.
+// This is the feedback path for cron agent-prompt tasks — scheduled tasks
+// can call this tool to report results back to the user on Discord.
+//
+// Args: {"message": "Your portfolio summary: ..."}
+// Optional: {"channel_id": "..."} — future use; webhook already targets a channel.
+//
+// Requires discord_webhook to be set in config.toml:
+//   bareclaw config set discord_webhook "https://discord.com/api/webhooks/..."
+
+fn toolDiscordNotify(ctx: *ToolContext, args_json: []const u8) !ToolResult {
+    const webhook_url = ctx.cfg.discord_webhook;
+    if (webhook_url.len == 0) {
+        return ToolResult.literal(false,
+            "discord_notify: discord_webhook is not configured. " ++
+            "Run: bareclaw config set discord_webhook \"https://discord.com/api/webhooks/...\"");
+    }
+
+    const parsed = std.json.parseFromSlice(std.json.Value, ctx.allocator, args_json, .{}) catch
+        return ToolResult.literal(false, "discord_notify: invalid JSON args");
+    defer parsed.deinit();
+
+    const message = getString(parsed.value, "message") orelse
+        return ToolResult.literal(false, "discord_notify: missing 'message' field");
+
+    ctx.policy.auditLog("discord_notify", "webhook") catch {};
+
+    // Build the Discord webhook JSON payload: {"content": "<message>"}
+    // We JSON-encode the message string to safely escape quotes/newlines.
+    var body_buf = std.ArrayList(u8).init(ctx.allocator);
+    defer body_buf.deinit();
+    try body_buf.appendSlice("{\"content\":");
+    try std.json.stringify(message, .{}, body_buf.writer());
+    try body_buf.append('}');
+
+    const uri = std.Uri.parse(webhook_url) catch {
+        return ToolResult.literal(false, "discord_notify: invalid webhook URL in config");
+    };
+
+    var client = std.http.Client{ .allocator = ctx.allocator };
+    defer client.deinit();
+
+    var response_buf = std.ArrayList(u8).init(ctx.allocator);
+    defer response_buf.deinit();
+
+    const fetch_result = client.fetch(.{
+        .method = .POST,
+        .location = .{ .uri = uri },
+        .payload = body_buf.items,
+        .extra_headers = &[_]std.http.Header{
+            .{ .name = "Content-Type", .value = "application/json" },
+        },
+        .response_storage = .{ .dynamic = &response_buf },
+    }) catch |err| {
+        const msg = try std.fmt.allocPrint(ctx.allocator, "discord_notify: HTTP error: {}", .{err});
+        return ToolResult.owned(false, msg);
+    };
+
+    // Discord returns 204 No Content on success.
+    const status = @intFromEnum(fetch_result.status);
+    if (status == 204 or status < 300) {
+        return ToolResult.literal(true, "Message sent to Discord.");
+    }
+
+    const msg = try std.fmt.allocPrint(
+        ctx.allocator, "discord_notify: Discord returned HTTP {d}: {s}",
+        .{ status, response_buf.items },
+    );
+    return ToolResult.owned(false, msg);
+}
+
 // ── cron tools ────────────────────────────────────────────────────────────────
 //
 // Native built-in tools for Bear to manage its own cron scheduler.
@@ -651,6 +725,7 @@ pub fn buildCoreTools(
     try list.append(Tool{ .name = "git_operations",       .description = "Run a git subcommand in the workspace",                 .executeFn = toolGitOperations });
     try list.append(Tool{ .name = "agent_status",         .description = "Return agent runtime status (workspace, memory count)", .executeFn = toolAgentStatus });
     try list.append(Tool{ .name = "audit_log_read",       .description = "Read the last N lines of the audit log",               .executeFn = toolAuditLogRead });
+    try list.append(Tool{ .name = "discord_notify",       .description = "Send a message to Discord via webhook. Args: {\"message\":\"text\"}. Requires discord_webhook in config.", .executeFn = toolDiscordNotify });
     try list.append(Tool{ .name = "cron_list",            .description = "List all scheduled cron tasks",                        .executeFn = toolCronList });
     try list.append(Tool{ .name = "cron_add_prompt",      .description = "Schedule a recurring agent-prompt task. Args: {\"schedule\":\"0 9 * * *\",\"prompt\":\"your prompt here\"}", .executeFn = toolCronAddPrompt });
     try list.append(Tool{ .name = "cron_remove",          .description = "Remove a cron task by ID. Args: {\"id\":\"t1\"}",      .executeFn = toolCronRemove });

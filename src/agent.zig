@@ -441,6 +441,7 @@ fn runAgentOnceToWriter(
         // Try to dispatch tool calls from this reply.
         const dispatched = try dispatchAllToolCalls(
             allocator,
+            cfg,
             tools,
             policy,
             memory,
@@ -526,6 +527,7 @@ fn extractJsonObject(input: []const u8) ?[]const u8 {
 /// Returns true if at least one tool call was found and dispatched.
 fn dispatchAllToolCalls(
     allocator: std.mem.Allocator,
+    cfg: *const config_mod.Config,
     tools: []const tools_mod.Tool,
     policy: *security_mod.SecurityPolicy,
     memory: *memory_mod.MemoryBackend,
@@ -572,6 +574,7 @@ fn dispatchAllToolCalls(
 
             var ctx2 = tools_mod.ToolContext{
                 .allocator = allocator,
+                .cfg       = cfg,
                 .policy    = policy,
                 .memory    = memory,
                 .mcp_pool  = mcp_pool,
@@ -606,6 +609,7 @@ fn dispatchAllToolCalls(
 
     var ctx = tools_mod.ToolContext{
         .allocator = allocator,
+        .cfg       = cfg,
         .policy    = policy,
         .memory    = memory,
         .mcp_pool  = mcp_pool,
