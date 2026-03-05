@@ -1,6 +1,6 @@
-# Network Deployment — BareClaw on Raspberry Pi and Local Networks
+# Network Deployment — BearClaw on Raspberry Pi and Local Networks
 
-This document covers deploying BareClaw on a Raspberry Pi or any remote host, with Telegram, Discord, and optional gateway webhook channels.
+This document covers deploying BearClaw on a Raspberry Pi or any remote host, with Telegram, Discord, and optional gateway webhook channels.
 
 ---
 
@@ -8,15 +8,15 @@ This document covers deploying BareClaw on a Raspberry Pi or any remote host, wi
 
 | Mode | Inbound port needed? | Use case |
 |------|----------------------|----------|
-| **Telegram polling** | No | BareClaw polls Telegram API (outbound only) |
-| **Discord Gateway** | No | BareClaw connects to Discord Gateway WebSocket (outbound only) |
+| **Telegram polling** | No | BearClaw polls Telegram API (outbound only) |
+| **Discord Gateway** | No | BearClaw connects to Discord Gateway WebSocket (outbound only) |
 | **Gateway webhook** | Yes | External services need to POST to your gateway |
 
-**Key:** Telegram and Discord use outbound connections — BareClaw makes requests to their APIs. No port forwarding or public IP is required for these channels.
+**Key:** Telegram and Discord use outbound connections — BearClaw makes requests to their APIs. No port forwarding or public IP is required for these channels.
 
 ---
 
-## 2. BareClaw on Raspberry Pi
+## 2. BearClaw on Raspberry Pi
 
 ### 2.1 Prerequisites
 
@@ -83,7 +83,7 @@ For a permanent setup, add it to `~/.bashrc` or `~/.zshrc`.
 bareclaw channel telegram
 ```
 
-BareClaw polls `https://api.telegram.org` outbound. No firewall changes or public IP required. Works behind NAT on a home network.
+BearClaw polls `https://api.telegram.org` outbound. No firewall changes or public IP required. Works behind NAT on a home network.
 
 ### 2.5 Run Discord Channel (No Port Forwarding Needed)
 
@@ -91,7 +91,7 @@ BareClaw polls `https://api.telegram.org` outbound. No firewall changes or publi
 bareclaw channel discord
 ```
 
-BareClaw opens a TLS WebSocket to `gateway.discord.gg:443` outbound. Same story — no inbound ports required.
+BearClaw opens a TLS WebSocket to `gateway.discord.gg:443` outbound. Same story — no inbound ports required.
 
 ### 2.6 Run Daemon (Gateway + Cron)
 
@@ -109,7 +109,7 @@ Starts the HTTP gateway on `127.0.0.1:8080` and runs any enabled cron tasks. The
 
 If you want other devices on your LAN to reach the gateway (e.g. for pairing or custom webhooks), bind to `0.0.0.0`:
 
-> **Note:** This is not yet a config option in BareClaw — the gateway currently always binds to `127.0.0.1`. LAN binding and `allow_public_bind` config support is on the roadmap.
+> **Note:** This is not yet a config option in BearClaw — the gateway currently always binds to `127.0.0.1`. LAN binding and `allow_public_bind` config support is on the roadmap.
 
 As a workaround, use a tunnel (see below) or a reverse proxy like nginx listening on `0.0.0.0:8080` forwarding to `127.0.0.1:8080`.
 
@@ -184,7 +184,7 @@ Create `/etc/systemd/user/bareclaw.service`:
 
 ```ini
 [Unit]
-Description=BareClaw AI Agent
+Description=BearClaw AI Agent
 After=network.target
 
 [Service]

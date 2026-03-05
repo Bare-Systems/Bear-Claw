@@ -1,4 +1,4 @@
-/// Minimal HTTP/1.1 gateway for BareClaw.
+/// Minimal HTTP/1.1 gateway for BearClaw.
 ///
 /// Endpoints:
 ///   GET  /health    → 200 JSON {"status":"ok","service":"bareclaw"}
@@ -20,7 +20,7 @@ pub fn runGateway(port: u16) !void {
     var server = try addr.listen(.{ .reuse_address = true });
     defer server.deinit();
 
-    try stdout.print("BareClaw gateway listening on http://127.0.0.1:{d}\n", .{port});
+    try stdout.print("BearClaw gateway listening on http://127.0.0.1:{d}\n", .{port});
     try stdout.print("Endpoints: GET /health  POST /webhook   (Ctrl-C to stop)\n", .{});
 
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
@@ -35,6 +35,42 @@ pub fn runGateway(port: u16) !void {
         handleConnection(allocator, conn) catch |err| {
             try stdout.print("connection error: {}\n", .{err});
         };
+    }
+}
+
+/// Like runGateway but polls for connections in 500ms windows so the daemon
+/// can stop it cleanly by setting shutdown=true.
+pub fn runGatewayWithShutdown(port: u16, shutdown: *const std.atomic.Value(bool)) !void {
+    const stdout = std.io.getStdOut().writer();
+
+    const addr = try std.net.Address.parseIp4("127.0.0.1", port);
+    var server = try addr.listen(.{ .reuse_address = true });
+    defer server.deinit();
+
+    try stdout.print("BearClaw gateway listening on http://127.0.0.1:{d}\n", .{port});
+
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // Poll the listening socket in 500ms windows so the thread can exit when
+    // the daemon sets the shutdown flag.
+    const fd = server.stream.handle;
+    var fds = [_]std.posix.pollfd{.{
+        .fd = fd,
+        .events = std.posix.POLL.IN,
+        .revents = 0,
+    }};
+
+    while (!shutdown.load(.acquire)) {
+        const ready = std.posix.poll(&fds, 500) catch |err| switch (err) {
+            error.SystemResources => continue,
+            else => return err,
+        };
+        if (ready == 0) continue; // timeout — check shutdown and loop
+        if (shutdown.load(.acquire)) break;
+        const conn = server.accept() catch continue;
+        handleConnection(allocator, conn) catch {};
     }
 }
 

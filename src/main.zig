@@ -25,7 +25,7 @@ pub fn main() !void {
     var stdout = std.io.getStdOut().writer();
 
     if (args.len <= 1) {
-        try stdout.print("BareClaw – zero-compromise AI claws, bear edition.\n", .{});
+        try stdout.print("BearClaw – zero-compromise AI claws, bear edition.\n", .{});
         try stdout.print("Usage: {s} [--api-key <key>] <command> [options]\n", .{args[0]});
         try stdout.print("Commands: onboard | agent | status | doctor | config | mcp | gateway | daemon | cron | channel | peripheral | migrate\n", .{});
         return;
@@ -50,7 +50,7 @@ pub fn main() !void {
         }
     }
     if (cmd_idx >= args.len) {
-        try stdout.print("BareClaw – no command given.\n", .{});
+        try stdout.print("BearClaw – no command given.\n", .{});
         return;
     }
     const cmd = args[cmd_idx];
@@ -141,7 +141,7 @@ pub fn main() !void {
         const input = if (args.len > cmd_idx + 1)
             args[cmd_idx + 1]
         else
-            "Hello from BareClaw. How can you help me today?";
+            "Hello from BearClaw. How can you help me today?";
 
         try agent_mod.runAgentOnce(
             allocator,
@@ -323,7 +323,7 @@ pub fn main() !void {
 }
 
 fn printStatus(allocator: std.mem.Allocator, cfg: *const config_mod.Config, stdout: anytype) !void {
-    try stdout.print("🐻 BareClaw Status\n\n", .{});
+    try stdout.print("🐻 BearClaw Status\n\n", .{});
     try stdout.print("Workspace:  {s}\n", .{cfg.workspace_dir});
     try stdout.print("Config:     {s}\n", .{cfg.config_path});
     try stdout.print("Provider:   {s}\n", .{cfg.default_provider});
@@ -372,7 +372,7 @@ fn printStatus(allocator: std.mem.Allocator, cfg: *const config_mod.Config, stdo
 
 /// Doctor command: check health of key subsystems and report issues.
 fn runDoctor(allocator: std.mem.Allocator, cfg: *const config_mod.Config, stdout: anytype) !void {
-    try stdout.print("🐻 BareClaw Doctor\n\n", .{});
+    try stdout.print("🐻 BearClaw Doctor\n\n", .{});
 
     var all_ok = true;
 

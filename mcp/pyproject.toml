@@ -1,7 +1,7 @@
 [project]
 name = "bareclaw-mcp"
 version = "0.1.0"
-description = "MCP server for BareClaw – agent-driven development harness"
+description = "MCP server for BearClaw – agent-driven development harness"
 requires-python = ">=3.10"
 dependencies = [
     "mcp[cli]>=1.2.0",

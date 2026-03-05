@@ -8,6 +8,6 @@ pub const PeripheralConfig = struct {
 
 pub fn listConfiguredPeripherals() !void {
     var stdout = std.io.getStdOut().writer();
-    try stdout.print("BareClaw peripherals stub – no boards configured yet.\n", .{});
+    try stdout.print("BearClaw peripherals stub – no boards configured yet.\n", .{});
 }
 

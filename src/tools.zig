@@ -765,7 +765,7 @@ pub fn freeTools(allocator: std.mem.Allocator, tools: []Tool) void {
 
 // ── MCP proxy tools ───────────────────────────────────────────────────────────
 //
-// Each MCP server tool is represented as a BareClaw Tool with an McpProxyMeta
+// Each MCP server tool is represented as a BearClaw Tool with an McpProxyMeta
 // stored in user_data. The single proxy executeFn reads the metadata to
 // determine which MCP server to call and which tool name to invoke.
 

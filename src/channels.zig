@@ -1,4 +1,4 @@
-/// Channel implementations for BareClaw.
+/// Channel implementations for BearClaw.
 ///
 /// Channels:
 ///   CLI      – stdin/stdout, single-turn or interactive loop
@@ -61,7 +61,7 @@ pub fn runCliChannelOnce(cfg: *const config_mod.Config) !void {
     const stdin  = std.io.getStdIn().reader();
     const stdout = std.io.getStdOut().writer();
 
-    try stdout.print("BareClaw CLI channel – type a message and press Enter.\n> ", .{});
+    try stdout.print("BearClaw CLI channel – type a message and press Enter.\n> ", .{});
 
     var buf: [4096]u8 = undefined;
     const line = (try stdin.readUntilDelimiterOrEof(&buf, '\n')) orelse return;
@@ -123,7 +123,7 @@ pub fn runCliChannelLoop(cfg: *const config_mod.Config) !void {
     try all_tools.appendSlice(stack.tool_registry);
     try all_tools.appendSlice(mcp_tools);
 
-    try stdout.print("BareClaw interactive CLI – type 'exit' to quit.\n", .{});
+    try stdout.print("BearClaw interactive CLI – type 'exit' to quit.\n", .{});
 
     // T2-1: Initialise conversation history for this session.
     var history = agent_mod.ConversationHistory.init(allocator);
@@ -906,7 +906,7 @@ fn telegramPollLoop(
 
             // Run agent.
             const reply = any_provider.chatOnce(
-                "You are BareClaw, a fast, bear-themed AI assistant.",
+                "You are BearClaw, a fast, bear-themed AI assistant.",
                 text,
                 cfg.default_model,
                 0.7,

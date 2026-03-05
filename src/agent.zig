@@ -251,7 +251,7 @@ fn runAgentOnceToWriter(
         try sw.writeAll(cfg.system_prompt);
     } else {
         // ── Built-in factual system prompt ────────────────────────────────────
-        // Ground the model in what BareClaw actually is, how its memory and
+        // Ground the model in what BearClaw actually is, how its memory and
         // workspace work, and what each tool does — so it can answer questions
         // about itself accurately instead of hallucinating.
         try sw.writeAll(
@@ -326,7 +326,7 @@ fn runAgentOnceToWriter(
 
         try sw.writeAll(
             "## What You Are\n" ++
-            "BareClaw is not a cloud service. It runs as a single binary with no external\n" ++
+            "BearClaw is not a cloud service. It runs as a single binary with no external\n" ++
             "dependencies, directly on the user's hardware. It supports:\n" ++
             "- CLI interactive loop (channel loop)\n" ++
             "- Discord bot (WebSocket Gateway) — responds when @mentioned or in DMs\n" ++

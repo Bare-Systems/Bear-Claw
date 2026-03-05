@@ -1,4 +1,4 @@
-# CLAUDE.md — BareClaw Agent Engineering Protocol
+# CLAUDE.md — BearClaw Agent Engineering Protocol
 
 This file defines the working protocol for Claude Code in this repository.
 Scope: entire repository.
@@ -7,7 +7,7 @@ Scope: entire repository.
 
 ## Agent Driven Hyper Development
 
-The MCP server (`mcp/server.py`) is the primary development interface. All features of of BareClaw, and actions taken to develop it, shuold be wrapped in mcp tools. This is the primary entrance point for you test perform building, testing, or validation of the running system. 
+The MCP server (`mcp/server.py`) is the primary development interface. All features of of BearClaw, and actions taken to develop it, shuold be wrapped in mcp tools. This is the primary entrance point for you test perform building, testing, or validation of the running system. 
 
 ### Keep MCP updated
 
@@ -15,7 +15,7 @@ Whenever you build a new feature leverage the MCP server to test it. If you need
 
 ### The Agent Development Loop
 
-When building a new feature in BareClaw, the canonical loop is:
+When building a new feature in BearClaw, the canonical loop is:
 
 1. Understand the current code — `read_source_file()`, `repo_structure()`
 2. Edit the source code
@@ -31,7 +31,7 @@ When building a new feature in BareClaw, the canonical loop is:
 
 ## 1) Project Snapshot (Read First)
 
-BareClaw is a **Zig 0.14** autonomous AI agent runtime ptimized for:
+BearClaw is a **Zig 0.14** autonomous AI agent runtime ptimized for:
 
 - zero external dependencies (Zig stdlib only)
 - minimal binary size and fast startup
@@ -234,7 +234,7 @@ Anthropic format note: Anthropic uses `POST /v1/messages`, `x-api-key` header (n
 
 ### Connecting an MCP Server
 
-BareClaw can use any MCP server as a tool source — no code changes required.
+BearClaw can use any MCP server as a tool source — no code changes required.
 
 **At the command line:**
 ```bash
@@ -256,7 +256,7 @@ mcp_call_tool(server="autotrader", tool="get_status")
 **What happens at agent startup:**
 1. `parseMcpServers()` splits the config string into `McpServerDef` entries
 2. `buildMcpTools()` spawns each server, completes the MCP handshake, calls `tools/list`
-3. Each discovered tool becomes a BareClaw `Tool` named `servername__toolname`
+3. Each discovered tool becomes a BearClaw `Tool` named `servername__toolname`
 4. `McpSessionPool` keeps sessions alive across tool calls in one agent run
 
 **Validation:** After adding a server, run:

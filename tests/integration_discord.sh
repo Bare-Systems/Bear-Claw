@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# BareClaw Discord Integration Test
+# BearClaw Discord Integration Test
 #
 # Tests the full round-trip:
 #   1. Start bareclaw channel discord
@@ -80,7 +80,7 @@ trap cleanup EXIT
 
 echo ""
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-echo "  BareClaw Discord Integration Test"
+echo "  BearClaw Discord Integration Test"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 echo ""
 

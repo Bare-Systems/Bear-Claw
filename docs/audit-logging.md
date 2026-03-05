@@ -1,8 +1,8 @@
-# Audit Logging — BareClaw
+# Audit Logging — BearClaw
 
 ## Overview
 
-Every tool call in BareClaw is logged to an append-only audit trail **before** the tool executes. This gives you a tamper-evident record of what the agent did, when, and with what arguments.
+Every tool call in BearClaw is logged to an append-only audit trail **before** the tool executes. This gives you a tamper-evident record of what the agent did, when, and with what arguments.
 
 ---
 
@@ -129,7 +129,7 @@ bareclaw audit --format json --output audit.json
 
 ## Log Rotation
 
-BareClaw does not currently rotate audit logs. For long-running deployments, manage rotation externally:
+BearClaw does not currently rotate audit logs. For long-running deployments, manage rotation externally:
 
 ```bash
 # Example: rotate when over 50MB, keep 5 archives

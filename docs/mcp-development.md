@@ -1,8 +1,8 @@
 # MCP-First Development — Agent Driven Hyper Development (ADHD)
 
-BareClaw is designed around a core principle we call **ADHD: Agent Driven Hyper Development**.
+BearClaw is designed around a core principle we call **ADHD: Agent Driven Hyper Development**.
 
-The idea is simple: AI agents should be able to build, test, run, and iterate on BareClaw itself — as fast as possible, with as little friction as possible — using BareClaw's own MCP server as the development harness.
+The idea is simple: AI agents should be able to build, test, run, and iterate on BearClaw itself — as fast as possible, with as little friction as possible — using BearClaw's own MCP server as the development harness.
 
 ---
 
@@ -13,9 +13,9 @@ The idea is simple: AI agents should be able to build, test, run, and iterate on
 1. **Agents are first-class developers** — not just users of the tool, but active contributors to it
 2. **The feedback loop is as tight as possible** — build → test → run → inspect in seconds, not minutes
 3. **Context never leaves the conversation** — the agent reads code, writes code, compiles, tests, and runs all within a single coherent session
-4. **The tool builds itself** — BareClaw agents running via Telegram, Discord, or CLI can iterate on the BareClaw Zig source using the same MCP tools
+4. **The tool builds itself** — BearClaw agents running via Telegram, Discord, or CLI can iterate on the BearClaw Zig source using the same MCP tools
 
-This is why the MCP server exists. It is not a convenience wrapper — it is the **primary development interface** for anyone (human or agent) building BareClaw.
+This is why the MCP server exists. It is not a convenience wrapper — it is the **primary development interface** for anyone (human or agent) building BearClaw.
 
 ---
 
@@ -105,7 +105,7 @@ zig build / zig build test        zig-out/bin/bareclaw
                     (source inspection)   (config + workspace)
 ```
 
-The MCP server is intentionally thin. It shells out to the Zig build system and the BareClaw binary. All intelligence lives in the Zig runtime and in the agent using the MCP tools.
+The MCP server is intentionally thin. It shells out to the Zig build system and the BearClaw binary. All intelligence lives in the Zig runtime and in the agent using the MCP tools.
 
 ---
 
@@ -207,15 +207,15 @@ read_config()                        → is the right provider/model configured?
 
 ## The Self-Improvement Loop
 
-The deepest expression of ADHD is using BareClaw agents to improve BareClaw itself:
+The deepest expression of ADHD is using BearClaw agents to improve BearClaw itself:
 
 ```
-1. Start a Telegram or Discord channel session with BareClaw
-2. Ask the BareClaw agent: "Read tools.zig and suggest what tool is missing"
+1. Start a Telegram or Discord channel session with BearClaw
+2. Ask the BearClaw agent: "Read tools.zig and suggest what tool is missing"
 3. Agent reads source, identifies gap, suggests implementation
 4. Developer (or another agent in Claude Code) implements the suggestion
 5. build() → run_tests() → run_agent() to verify
-6. The improved BareClaw is now available to the same Telegram/Discord session
+6. The improved BearClaw is now available to the same Telegram/Discord session
 ```
 
 This is intentional. The runtime that processes natural language commands is also the runtime that can reason about and propose improvements to itself.
@@ -239,5 +239,5 @@ When adding new MCP tools to `mcp/server.py`:
 - `mcp/server.py` — the MCP server implementation
 - `mcp/README.md` — setup, registration, and tool reference
 - `CLAUDE.md` — full agent engineering protocol (includes ADHD principle in section 0)
-- `src/agent.zig` — the BareClaw agent loop that MCP `run_agent()` invokes
+- `src/agent.zig` — the BearClaw agent loop that MCP `run_agent()` invokes
 - `src/channels.zig` — channel implementations (Telegram, Discord) that can be used in the self-improvement loop

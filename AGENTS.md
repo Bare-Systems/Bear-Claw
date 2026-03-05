@@ -1,11 +1,11 @@
-# AGENTS.md — BareClaw Agent Engineering Protocol
+# AGENTS.md — BearClaw Agent Engineering Protocol
 
 This file defines the working protocol for coding agents in this repository.
 Scope: entire repository.
 
 ## 1) Project Snapshot (Read First)
 
-BareClaw is a Zig-first autonomous agent runtime optimized for:
+BearClaw is a Zig-first autonomous agent runtime optimized for:
 
 - high performance
 - high efficiency
@@ -30,7 +30,7 @@ Key extension points:
 These realities should drive every design decision:
 
 1. **No allocator-hiding** — every function that allocates takes an explicit `std.mem.Allocator`. Callers own their memory. Never stash allocators inside opaque state.
-2. **Zero external dependencies** — BareClaw uses only the Zig standard library. TLS, HTTP, JSON, and crypto are all stdlib. Resist adding dependencies; they regress binary size and portability.
+2. **Zero external dependencies** — BearClaw uses only the Zig standard library. TLS, HTTP, JSON, and crypto are all stdlib. Resist adding dependencies; they regress binary size and portability.
 3. **Zig 0.14 idioms are the law** — `var` vs `const` strictness, the `tls.readAtLeast(tcp, ...)` API pattern (TLS does not own the stream), `@intCast` for type narrowing. When in doubt, check what `zig build` says.
 4. **AnyProvider vtable is the stability backbone** — `agent.zig` is decoupled from concrete backends via `AnyProvider`. Adding a provider means adding a `chatFn` implementation and wiring it in `createProviderByName()`. Agent code never changes.
 5. **Security surfaces are first-class** — `security.zig`, `tools.zig`, and `gateway.zig` carry real blast radius. Path policy, shell blocklist, and audit logging are not optional features; they are default behavior.

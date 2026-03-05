@@ -1,6 +1,6 @@
-# Contributing to BareClaw
+# Contributing to BearClaw
 
-Thanks for your interest in contributing! BareClaw is optimized for embedded-first deployments. This guide will get you set up.
+Thanks for your interest in contributing! BearClaw is optimized for embedded-first deployments. This guide will get you set up.
 
 ## Development Setup
 
@@ -34,7 +34,7 @@ If both pass, you're clear. There are no external linting or formatting tools re
 
 ## Local Secret Management
 
-BareClaw never commits API keys. Follow these rules:
+BearClaw never commits API keys. Follow these rules:
 
 ### Setting Keys for Development
 
@@ -99,7 +99,7 @@ When in doubt, choose the higher track.
 
 ## Architecture: Extension Points
 
-BareClaw's architecture is modular. Adding a new capability means implementing one clean addition and wiring it in — not cross-cutting rewrites.
+BearClaw's architecture is modular. Adding a new capability means implementing one clean addition and wiring it in — not cross-cutting rewrites.
 
 ```
 src/

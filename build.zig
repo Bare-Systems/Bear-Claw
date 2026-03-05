@@ -65,6 +65,12 @@ pub fn build(b: *std.Build) void {
         .root_module = exe_mod,
     });
 
+    // Link system libsqlite3 for the SQLite memory backend.
+    exe.linkSystemLibrary("sqlite3");
+    exe.linkLibC();
+    lib.linkSystemLibrary("sqlite3");
+    lib.linkLibC();
+
     // This declares intent for the executable to be installed into the
     // standard location when the user invokes the "install" step (the default
     // step when running `zig build`).
@@ -98,12 +104,16 @@ pub fn build(b: *std.Build) void {
     const lib_unit_tests = b.addTest(.{
         .root_module = lib_mod,
     });
+    lib_unit_tests.linkSystemLibrary("sqlite3");
+    lib_unit_tests.linkLibC();
 
     const run_lib_unit_tests = b.addRunArtifact(lib_unit_tests);
 
     const exe_unit_tests = b.addTest(.{
         .root_module = exe_mod,
     });
+    exe_unit_tests.linkSystemLibrary("sqlite3");
+    exe_unit_tests.linkLibC();
 
     const run_exe_unit_tests = b.addRunArtifact(exe_unit_tests);
 

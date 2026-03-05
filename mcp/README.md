@@ -1,6 +1,6 @@
-# BareClaw MCP Server 🐻
+# BearClaw MCP Server 🐻
 
-The agent-driven development harness for BareClaw. This is the **primary development interface** — not a convenience wrapper. It exists so AI agents can close the full build-test-run-inspect loop without a terminal, without context switching, and without friction.
+The agent-driven development harness for BearClaw. This is the **primary development interface** — not a convenience wrapper. It exists so AI agents can close the full build-test-run-inspect loop without a terminal, without context switching, and without friction.
 
 ---
 
@@ -8,9 +8,9 @@ The agent-driven development harness for BareClaw. This is the **primary develop
 
 **ADHD = Agent Driven Hyper Development.**
 
-BareClaw is built by agents, for agents, using agents.
+BearClaw is built by agents, for agents, using agents.
 
-Most dev tools assume a human is at the keyboard. BareClaw assumes an agent is in the loop. The MCP server is the mechanism that makes agent-driven development **fast and tight**:
+Most dev tools assume a human is at the keyboard. BearClaw assumes an agent is in the loop. The MCP server is the mechanism that makes agent-driven development **fast and tight**:
 
 ```
 Agent reads source → edits code → build() → run_tests() → run_agent() → reads output → iterates
@@ -22,7 +22,7 @@ Agent reads source → edits code → build() → run_tests() → run_agent() �
 
 Traditional development has friction: open terminal, run command, read output, switch back to editor, repeat. For an AI agent — or a human with ADHD — that friction compounds into lost flow, lost context, and slower iteration.
 
-The MCP server eliminates that friction. Every part of the BareClaw development cycle is a **tool call**:
+The MCP server eliminates that friction. Every part of the BearClaw development cycle is a **tool call**:
 
 - Understand the codebase → `read_source_file()`, `repo_structure()`
 - Write code → Claude Code's file tools (Edit, Write)
@@ -33,9 +33,9 @@ The MCP server eliminates that friction. Every part of the BareClaw development 
 
 The agent stays in one conversation. One context. No terminal tabs. No copy-pasting output. No "now run this command." Just a tight loop that produces working Zig.
 
-### Self-Bootstrapping: BareClaw Builds BareClaw
+### Self-Bootstrapping: BearClaw Builds BearClaw
 
-The deeper principle is that BareClaw agents — running via Telegram, Discord, or CLI — can be used to iterate on the BareClaw runtime itself. The MCP server makes the boundary between "using BareClaw" and "building BareClaw" intentionally thin. This is the embedded-AI equivalent of a self-hosting compiler.
+The deeper principle is that BearClaw agents — running via Telegram, Discord, or CLI — can be used to iterate on the BearClaw runtime itself. The MCP server makes the boundary between "using BearClaw" and "building BearClaw" intentionally thin. This is the embedded-AI equivalent of a self-hosting compiler.
 
 ---
 
@@ -44,7 +44,7 @@ The deeper principle is that BareClaw agents — running via Telegram, Discord, 
 - Python 3.10+
 - [uv](https://github.com/astral-sh/uv) (`brew install uv` or `pip install uv`)
 - Zig 0.14+
-- The BareClaw binary built at `zig-out/bin/bareclaw` (for runtime tools)
+- The BearClaw binary built at `zig-out/bin/bareclaw` (for runtime tools)
 
 ---
 
@@ -59,12 +59,12 @@ uv sync
 
 ## Register with Claude 
 
-The MCP server for BareClaw can be configured for Claude and other tools with a config like so:
+The MCP server for BearClaw can be configured for Claude and other tools with a config like so:
 
 ```json
 {
   "mcpServers": {
-    "BareClaw": {
+    "BearClaw": {
         "command": "/path/to/bareclaw/mcp/.venv/bin/python3",
         "args": ["/path/to/bareclaw/mcp/server.py"]
     }
@@ -72,7 +72,7 @@ The MCP server for BareClaw can be configured for Claude and other tools with a 
 }
 ```
 
-Restart Claude Desktop after saving. The `BareClaw` tools will appear in Claude's tool palette.
+Restart Claude Desktop after saving. The `BearClaw` tools will appear in Claude's tool palette.
 
 ---
 
@@ -127,7 +127,7 @@ uv run --with mcp-inspector mcp inspect server.py
 
 ## The Canonical Agent Development Loop
 
-When building or debugging a BareClaw feature, use this loop:
+When building or debugging a BearClaw feature, use this loop:
 
 ```
 1. read_source_file("provider.zig")   → understand current code
@@ -181,7 +181,7 @@ src/*.zig               (source tools: read_source_file, list_source_files)
 ~/.bareclaw/            (config tools: read_config, workspace_contents)
 ```
 
-No Zig code lives in the MCP server. No business logic. The server is a thin translation layer between MCP tool calls and the BareClaw CLI + build system. All intelligence is in the Zig binary and the agent using these tools.
+No Zig code lives in the MCP server. No business logic. The server is a thin translation layer between MCP tool calls and the BearClaw CLI + build system. All intelligence is in the Zig binary and the agent using these tools.
 
 ---
 
@@ -197,7 +197,7 @@ No Zig code lives in the MCP server. No business logic. The server is a thin tra
 
 ## Adding New MCP Tools
 
-When a new BareClaw CLI command is added, add a corresponding MCP tool in `server.py`:
+When a new BearClaw CLI command is added, add a corresponding MCP tool in `server.py`:
 
 ```python
 @mcp.tool()

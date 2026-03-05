@@ -1,4 +1,4 @@
-# BareClaw — Review & Feature Plan
+# BearClaw — Review & Feature Plan
 ---
 
 ## How to Read This Document
@@ -159,7 +159,7 @@ Add `next_run` and `last_result` fields to the TSV. The daemon loop should check
 **Source:** Both reviews
 **Depends on:** T2-3
 
-Extend the cron task format so a task can store a **prompt string** rather than (or in addition to) a shell command. When the daemon fires a prompt task, it calls `runAgentOnce()` and stores the result in memory under `cron/{task_id}/{timestamp}`. This is what makes BareClaw genuinely autonomous — recurring agent-driven work without user intervention.
+Extend the cron task format so a task can store a **prompt string** rather than (or in addition to) a shell command. When the daemon fires a prompt task, it calls `runAgentOnce()` and stores the result in memory under `cron/{task_id}/{timestamp}`. This is what makes BearClaw genuinely autonomous — recurring agent-driven work without user intervention.
 
 ### T2-5: Tool Output Size Limits
 **Source:** Review A (Feature Gap)

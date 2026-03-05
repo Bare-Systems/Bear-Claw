@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# BareClaw Smoke Test
+# BearClaw Smoke Test
 #
 # Fast sanity checks — no Discord needed:
 #   1. Binary exists and shows status
@@ -28,7 +28,7 @@ info() { echo -e "${YELLOW}→${NC} $1"; }
 
 echo ""
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-echo "  BareClaw Smoke Test"
+echo "  BearClaw Smoke Test"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 echo ""
 

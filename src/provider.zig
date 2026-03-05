@@ -1,4 +1,4 @@
-/// Provider abstraction for BareClaw.
+/// Provider abstraction for BearClaw.
 ///
 /// Supported backends (selected via config.default_provider):
 ///   "anthropic"        – Claude API  (POST /v1/messages, x-api-key auth)
@@ -280,7 +280,7 @@ pub fn createRouterWithKey(allocator: std.mem.Allocator, names: []const []const 
 fn echoResponse(allocator: std.mem.Allocator, user: []const u8) ![]u8 {
     return std.fmt.allocPrint(
         allocator,
-        "BareClaw echo (no API key configured): {s}",
+        "BearClaw echo (no API key configured): {s}",
         .{user},
     );
 }
@@ -299,7 +299,7 @@ fn chatOpenAI(
 
     // OpenRouter requires extra headers; add them if this is an OR provider.
     const extra_header: ?[]const u8 = if (self.kind == .openrouter)
-        "HTTP-Referer: https://bareclaw.local\r\nX-Title: BareClaw\r\n"
+        "HTTP-Referer: https://bareclaw.local\r\nX-Title: BearClaw\r\n"
     else
         null;
 

@@ -296,7 +296,7 @@ fn parseValue(line: []const u8) ?[]const u8 {
 
 pub fn quickOnboard(cfg: *Config, allocator: std.mem.Allocator, writer: anytype) !void {
     _ = allocator;
-    try writer.print("BareClaw quick onboarding...\n", .{});
+    try writer.print("BearClaw quick onboarding...\n", .{});
     try writer.print("Using workspace at {s}\n", .{cfg.workspace_dir});
     try writer.print("Default provider: {s}\n", .{cfg.default_provider});
     try writer.print("Default model:    {s}\n", .{cfg.default_model});

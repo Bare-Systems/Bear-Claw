@@ -32,7 +32,7 @@ Report them responsibly:
 
 ## Security Architecture
 
-BareClaw implements defense-in-depth security. Every layer applies independently; none is optional.
+BearClaw implements defense-in-depth security. Every layer applies independently; none is optional.
 
 ### Security Checklist
 
@@ -78,7 +78,7 @@ Every tool call is logged to `~/.bareclaw/workspace/audit.log` **before** execut
 
 Format: `unix_timestamp TAB tool_name TAB detail`
 
-The log is append-only. BareClaw never reads it back or rotates it automatically. Monitor it externally or use standard log management tools.
+The log is append-only. BearClaw never reads it back or rotates it automatically. Monitor it externally or use standard log management tools.
 
 ### Provider Security
 
@@ -90,7 +90,7 @@ The log is append-only. BareClaw never reads it back or rotates it automatically
 
 ## Sandboxing
 
-BareClaw's built-in security is workspace-scoped application-level enforcement. It does not provide OS-level process isolation by default.
+BearClaw's built-in security is workspace-scoped application-level enforcement. It does not provide OS-level process isolation by default.
 
 For higher-assurance deployments, see `docs/sandboxing.md` for options including:
 - **Firejail** — Linux seccomp + filesystem namespacing
@@ -99,7 +99,7 @@ For higher-assurance deployments, see `docs/sandboxing.md` for options including
 
 ---
 
-## What BareClaw Protects Against
+## What BearClaw Protects Against
 
 - Path traversal attacks (`../../../etc/passwd`)
 - Command injection via shell tool
@@ -107,7 +107,7 @@ For higher-assurance deployments, see `docs/sandboxing.md` for options including
 - Unauthorized tool calls (audit log provides traceability)
 - API key exposure via logs
 
-## What BareClaw Does NOT Currently Protect Against
+## What BearClaw Does NOT Currently Protect Against
 
 - A compromised process running as the same user
 - Resource exhaustion from runaway LLM API calls (rate limiting is on the roadmap)

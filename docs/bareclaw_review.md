@@ -1,8 +1,8 @@
-# Review and Enhancement Plan for **BareClaw**
+# Review and Enhancement Plan for **BearClaw**
 
 ## Existing Architecture
 
-BareClaw is a self‑hostable AI agent runtime written in Zig that aims for a tiny binary with **zero dependencies beyond the Zig standard library**【932555140858001†L0-L6】. The repository is designed around the principle of **Agent‑Driven Hyper Development (ADHD)** — agents should be able to build, test and even modify the BareClaw runtime via the MCP (Model Context Protocol) server【932555140858001†L26-L44】.  Key points from the current architecture are:
+BearClaw is a self‑hostable AI agent runtime written in Zig that aims for a tiny binary with **zero dependencies beyond the Zig standard library**【932555140858001†L0-L6】. The repository is designed around the principle of **Agent‑Driven Hyper Development (ADHD)** — agents should be able to build, test and even modify the BearClaw runtime via the MCP (Model Context Protocol) server【932555140858001†L26-L44】.  Key points from the current architecture are:
 
 ### Providers and Models
 
@@ -26,7 +26,7 @@ BareClaw is a self‑hostable AI agent runtime written in Zig that aims for a ti
 
 ### MCP Client/Server
 
-* `mcp_client.zig` implements a **generic JSON‑RPC 2.0 client** that can spawn any MCP server as a subprocess, perform the handshake, discover tools via `tools/list` and call them via `tools/call`【44332349406240†L151-L165】.  A session pool caches connections across tool calls.  The repository also contains a Python MCP server (`mcp/server.py`) which wraps the BareClaw CLI and exposes build/test/run tools for agent‑driven development【212877492789752†L84-L99】.
+* `mcp_client.zig` implements a **generic JSON‑RPC 2.0 client** that can spawn any MCP server as a subprocess, perform the handshake, discover tools via `tools/list` and call them via `tools/call`【44332349406240†L151-L165】.  A session pool caches connections across tool calls.  The repository also contains a Python MCP server (`mcp/server.py`) which wraps the BearClaw CLI and exposes build/test/run tools for agent‑driven development【212877492789752†L84-L99】.
 
 ### Security
 
@@ -54,7 +54,7 @@ BareClaw is a self‑hostable AI agent runtime written in Zig that aims for a ti
 
 ## Enhancement Plan
 
-To evolve BareClaw into a **lightweight sub‑agent system capable of critical thinking, task completion and learning**, we propose the following plan.  Each suggestion includes implementation ideas consistent with the repository’s constraints (Zig stdlib, no external dependencies) and the development guidelines laid out in `CLAUDE.md`.
+To evolve BearClaw into a **lightweight sub‑agent system capable of critical thinking, task completion and learning**, we propose the following plan.  Each suggestion includes implementation ideas consistent with the repository’s constraints (Zig stdlib, no external dependencies) and the development guidelines laid out in `CLAUDE.md`.
 
 ### 1. Introduce a Planner/Reflector Module
 
@@ -62,7 +62,7 @@ To evolve BareClaw into a **lightweight sub‑agent system capable of critical t
 * **Implementation:**
   - Add a `planner.zig` module implementing a new `planAndExecute()` function.  The function would take the user’s goal and the tool registry, ask the provider to produce a structured plan (e.g., a JSON list of steps with tool names and arguments), and then execute each step via the existing tool dispatch.  After each step, results are fed back into the model with a prompt like “Here is the result. Do we continue or adjust the plan?” until the plan completes or a maximum depth is reached.
   - To encourage critical thinking, set the system prompt to instruct the model to **think step‑by‑step** and to check its work before finalising.  Use the multi‑round mechanism already in `agent.zig` to iterate.
-  - The planner can be exposed as a new tool (e.g., `planner_execute`) so the user or an external agent can ask BareClaw to plan a task.  This keeps the core agent loop simple and avoids recursive loops.
+  - The planner can be exposed as a new tool (e.g., `planner_execute`) so the user or an external agent can ask BearClaw to plan a task.  This keeps the core agent loop simple and avoids recursive loops.
 
 ### 2. Enhance Memory with Contextual and Semantic Recall
 
@@ -106,4 +106,4 @@ To evolve BareClaw into a **lightweight sub‑agent system capable of critical t
 
 ## Conclusion
 
-BareClaw already provides a solid foundation for a lightweight, extensible agent runtime.  By adding a planner/reflector module, enhancing memory with contextual storage and semantic recall, introducing a persistent task manager, personalising the system prompt, improving introspection tools, and hardening reliability, you can give your sub‑agent the **critical thinking, persistence and “soul”** you envisioned.  All proposed enhancements respect the zero‑dependency constraint and leverage existing architecture patterns, ensuring BareClaw remains portable and maintainable.
+BearClaw already provides a solid foundation for a lightweight, extensible agent runtime.  By adding a planner/reflector module, enhancing memory with contextual storage and semantic recall, introducing a persistent task manager, personalising the system prompt, improving introspection tools, and hardening reliability, you can give your sub‑agent the **critical thinking, persistence and “soul”** you envisioned.  All proposed enhancements respect the zero‑dependency constraint and leverage existing architecture patterns, ensuring BearClaw remains portable and maintainable.

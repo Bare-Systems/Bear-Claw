@@ -1,4 +1,4 @@
-/// Cron scheduler for BareClaw.
+/// Cron scheduler for BearClaw.
 ///
 /// Tasks are stored as one-per-line TSV in  ~/.bareclaw/cron.tsv:
 ///   id TAB schedule TAB command TAB enabled TAB last_run_ts TAB next_run_ts TAB prompt NEWLINE

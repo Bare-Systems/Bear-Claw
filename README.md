@@ -1,6 +1,6 @@
-# BareClaw 🐻
+# BearClaw 🐻
 
-A fast, self-hostable AI agent runtime written in Zig. BareClaw has zero dependencies beyond the Zig standard library, small binary, runs anywhere from your dev machine to a Raspberry Pi.
+A fast, self-hostable AI agent runtime written in Zig. BearClaw has zero dependencies beyond the Zig standard library, small binary, runs anywhere from your dev machine to a Raspberry Pi.
 
 > **Theme**: a pragmatic, hardware-savvy bear who guards your workspace — claws out, no compromises.
 
@@ -8,7 +8,7 @@ A fast, self-hostable AI agent runtime written in Zig. BareClaw has zero depende
 
 ## Table of Contents
 
-- [ADHD: Agent Driven Hyper Development](#adhd-agent-driven-hyper-development)
+- [MCP](#mcp)
 - [Features](#features)
 - [Quick Start](#quick-start)
 - [Configuration](#configuration)
@@ -24,19 +24,9 @@ A fast, self-hostable AI agent runtime written in Zig. BareClaw has zero depende
 
 ---
 
-## ADHD: Agent Driven Hyper Development
+## MCP
 
-BareClaw is built around a core design principle: **ADHD — Agent Driven Hyper Development**.
-
-The idea is that agents should be able to build, test, run, and iterate on BareClaw itself — as fast as possible, with zero friction — using BareClaw's own MCP server as the development harness.
-
-```
-read source → edit → build() → test() → run_agent() → inspect → iterate
-     ↑                                                                ↓
-     └───────────────── tight feedback loop, all in one session ──────┘
-```
-
-The MCP server (`mcp/`) is the **primary development interface**. It wraps the entire BareClaw CLI and build system as MCP tools so any agent (Claude Desktop, Claude Code, or a BareClaw agent itself) can:
+The Bare Claw repository comes equiped with an MCP server (`mcp/`) which wraps the entire BearClaw CLI and build system as MCP tools so any agent (Claude Desktop, Claude Code, or a BearClaw agent itself) can:
 
 - Read and understand the Zig source
 - Edit code and compile immediately
@@ -44,7 +34,14 @@ The MCP server (`mcp/`) is the **primary development interface**. It wraps the e
 - Send prompts to the live agent and inspect side effects
 - Close the loop — all without leaving the conversation
 
-**BareClaw agents can improve BareClaw.** A session running via Telegram or Discord can reason about and propose changes to its own Zig source — the same MCP tools the developer uses are available to any sufficiently capable agent.
+**BearClaw agents can improve BearClaw.** A session running via Telegram or Discord can reason about and propose changes to its own Zig source — the same MCP tools the developer uses are available to any sufficiently capable agent.
+
+Claude can be configured in CLI to user bareclaw like so:
+```sh
+cd mcp && uv sync
+cd ..
+claude mcp add bareclaw mcp/.venv/bin/python3 mcp/server.py
+```
 
 See [`docs/mcp-development.md`](docs/mcp-development.md) for the full ADHD playbook and [`mcp/README.md`](mcp/README.md) for setup.
 
@@ -96,14 +93,14 @@ zig build test
 
 ### Setting your API key
 
-BareClaw checks these environment variables in order:
+BearClaw checks these environment variables in order:
 
 ```bash
 export BARECLAW_API_KEY="your-key-here"   # preferred
 export API_KEY="your-key-here"            # generic fallback
 ```
 
-Without a key, BareClaw runs in **echo mode** — it reflects your input back as the reply, which is useful for testing tools and channels without an API.
+Without a key, BearClaw runs in **echo mode** — it reflects your input back as the reply, which is useful for testing tools and channels without an API.
 
 ---
 
@@ -162,7 +159,7 @@ bareclaw <command> [options]
 
 ## Providers
 
-BareClaw supports multiple AI backends. Set `default_provider` in config or use the fallback chain.
+BearClaw supports multiple AI backends. Set `default_provider` in config or use the fallback chain.
 
 ### Anthropic (Claude)
 
@@ -230,7 +227,7 @@ Reflects the user message back as the reply. No network calls. Useful for testin
 
 ### Fallback / Router
 
-Configure a comma-separated fallback chain. BareClaw tries each provider in order and returns the first successful response:
+Configure a comma-separated fallback chain. BearClaw tries each provider in order and returns the first successful response:
 
 ```toml
 default_provider   = "anthropic"
@@ -262,7 +259,7 @@ All tool calls are logged to the audit log before execution.
 
 ## Channels
 
-Channels are the interfaces through which users (or bots) interact with BareClaw.
+Channels are the interfaces through which users (or bots) interact with BearClaw.
 
 ### CLI — Single Turn
 
@@ -313,7 +310,7 @@ Long-polls `getUpdates` (30-second timeout). Processes each text message through
 
 ## Memory
 
-BareClaw stores persistent memory as Markdown files under `~/.bareclaw/workspace/memory/`.
+BearClaw stores persistent memory as Markdown files under `~/.bareclaw/workspace/memory/`.
 
 Each `memory_store` call writes `<key>.md`. `memory_recall` reads it back. `memory_forget` deletes it.
 
@@ -330,7 +327,7 @@ The `status` command shows a count of stored memory files.
 
 ## Security
 
-BareClaw enforces a layered security model:
+BearClaw enforces a layered security model:
 
 ### Path Policy
 
@@ -362,7 +359,7 @@ Format: `unix_timestamp TAB tool_name TAB detail`
 
 ## Cron
 
-BareClaw includes a lightweight task scheduler. Tasks are persisted as a TSV file at `~/.bareclaw/cron.tsv`.
+BearClaw includes a lightweight task scheduler. Tasks are persisted as a TSV file at `~/.bareclaw/cron.tsv`.
 
 ```bash
 # Add a task (schedule field is stored but not yet parsed for time-based firing)
@@ -432,7 +429,7 @@ bareclaw/
 └── build.zig             # Zig build system
 ```
 
-**No external dependencies** — BareClaw uses only the Zig standard library. TLS (for Discord WebSocket and HTTPS), HTTP, JSON parsing, and crypto are all stdlib.
+**No external dependencies** — BearClaw uses only the Zig standard library. TLS (for Discord WebSocket and HTTPS), HTTP, JSON parsing, and crypto are all stdlib.
 
 ### How the Agent Loop Works
 
