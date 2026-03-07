@@ -5,6 +5,27 @@ All notable changes to BearClaw will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.0] - unreleased
+
+### Added
+
+- `tardigrade` command to orchestrate a public edge deployment from BearClaw:
+  - launches local BearClaw gateway process
+  - launches Tardigrade process with edge env configuration on internal HTTP port
+  - launches Caddy TLS reverse-proxy so public endpoint is HTTPS by default
+  - generates bearer token and passes token hash to Tardigrade auth allowlist
+  - prints public endpoint + bearer token for mobile pairing
+  - prints cert SHA-256 fingerprint and copy/paste pairing payload (`JSON` + `tardi1:` compact code)
+- Internal localhost chat gateway endpoint `POST /v1/chat` in `src/gateway.zig`.
+- Gateway request parsing and JSON validation for `{ "message": "..." }`.
+- Single-turn agent execution path for gateway requests using existing provider/tools stack.
+- iOS-compatible chat response envelope with:
+  - `message` payload (`id`, `role`, `content`, `timestamp`)
+  - `requires_confirmation: false`
+  - `confirmation_reason: null`
+- Structured JSON error envelopes containing `request_id`.
+- `X-Correlation-ID` echo support on gateway responses when provided by caller.
+
 ## [0.2.0] - 2026-02-13
 
 ### Added

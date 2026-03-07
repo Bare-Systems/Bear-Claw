@@ -59,7 +59,7 @@ See [`docs/mcp-development.md`](docs/mcp-development.md) for the full ADHD playb
 | **Memory** | Markdown file-per-key store under `~/.bareclaw/workspace/memory/` |
 | **Security** | Path allowlisting, shell command blocklist, append-only audit log |
 | **Cron** | Persistent task scheduler with TSV storage, pause/resume, manual run |
-| **Gateway** | Minimal HTTP server (`/health`, `/webhook`) |
+| **Gateway** | Minimal internal HTTP server (`/health`, `/webhook`, `/v1/chat`) |
 | **Daemon** | Gateway + cron runner combined |
 | **Migration** | Import from OpenClaw workspace |
 
@@ -89,6 +89,16 @@ zig build
 
 # Run tests
 zig build test
+```
+
+### Install latest Linux binary
+
+```bash
+curl -fsSL -o bareclaw-linux-x86_64.tar.gz \
+  https://github.com/Bare-Labs/BearClaw/releases/latest/download/bareclaw-linux-x86_64.tar.gz
+tar -xzf bareclaw-linux-x86_64.tar.gz
+chmod +x bareclaw
+./bareclaw --help
 ```
 
 ### Setting your API key
@@ -152,6 +162,7 @@ bareclaw <command> [options]
 | `cron run` | Execute all enabled tasks immediately |
 | `gateway` | Start HTTP gateway on port 8080 |
 | `daemon` | Start gateway + cron runner together |
+| `tardigrade` | Start BearClaw gateway + Tardigrade edge together |
 | `peripheral` | List configured hardware peripherals |
 | `migrate` | Import workspace from OpenClaw (`~/.openclaw/workspace`) |
 
@@ -391,12 +402,15 @@ The `daemon` command runs `cron run` alongside the HTTP gateway so tasks execute
 bareclaw gateway
 ```
 
-Starts a minimal HTTP server on `127.0.0.1:8080`:
+Starts an internal HTTP server on `127.0.0.1:8080`:
 
 | Endpoint | Method | Response |
 |---|---|---|
 | `/health` | GET | `{"status":"ok","service":"bareclaw"}` |
 | `/webhook` | POST | `{"received":true}` |
+| `/v1/chat` | POST | `{"message":{...},"requires_confirmation":false,"confirmation_reason":null}` |
+
+`/v1/chat` is designed for trusted local callers (for example, Tardigrade edge running on the same host). It does not enforce bearer auth directly in this MVP.
 
 ### Daemon
 
@@ -405,6 +419,44 @@ bareclaw daemon
 ```
 
 Runs the gateway and cron runner together. Intended as a long-running background process for server deployments.
+
+### Tardigrade Orchestration
+
+```bash
+bareclaw tardigrade --tardigrade-bin /path/to/tardigrade
+```
+
+Optional flags:
+- `--host <host>` (default `0.0.0.0`)
+- `--port <port>` (default `8069`)
+- `--internal-port <port>` (default `18069`)
+- `--tls-cert <path>`
+- `--tls-key <path>`
+- `--caddy-bin <path>` (default `caddy`)
+
+This command:
+- starts local BearClaw gateway automatically
+- starts Tardigrade edge on an internal HTTP port
+- starts Caddy TLS reverse proxy in front of Tardigrade (HTTPS by default)
+- generates a bearer token and prints:
+  - public endpoint (`http[s]://<public-ip>:<port>`)
+  - bearer token for iPhone settings
+  - cert SHA-256 fingerprint
+  - pairing payload JSON and compact `tardi1:` pairing code
+
+If `--tls-cert`/`--tls-key` are not provided, BearClaw generates a self-signed certificate under `~/.bareclaw/tls/` using `openssl`.
+
+Pairing payload format:
+
+```json
+{
+  "endpoint": "https://<public-ip>:<port>",
+  "bearer_token": "<secret>",
+  "cert_sha256": "<64-char-lowercase-sha256>"
+}
+```
+
+Paste this payload (or the `tardi1:` code) into the iOS app Pairing section. The app pins `cert_sha256` and uses it for TLS trust.
 
 ---
 

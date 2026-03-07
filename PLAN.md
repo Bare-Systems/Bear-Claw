@@ -11,6 +11,31 @@ This document is grouped into three tiers:
 
 ---
 
+## Remote Secure Access MVP Track (Tardigrade -> BearClaw)
+
+Status: in progress
+
+- [x] add `bareclaw tardigrade` orchestration command as product entrypoint
+- [x] auto-launch local `bareclaw gateway` + external `tardigrade` process
+- [x] enforce HTTPS by default via Caddy TLS reverse-proxy sidecar
+- [x] auto-generate self-signed TLS cert/key when none provided
+- [x] generate bearer key, inject SHA-256 hash into Tardigrade env config
+- [x] print public endpoint + bearer key at startup for iPhone pairing
+- [x] emit copy/paste pairing payload protocol (`endpoint`, `bearer_token`, `cert_sha256`)
+- [x] keep gateway bound to `127.0.0.1` (internal trust boundary)
+- [x] publish Linux binary artifact to GitHub Releases (`bareclaw-linux-x86_64.tar.gz`)
+- [x] document release download/install path in README (`releases/latest/download`)
+- [x] add `POST /v1/chat` internal endpoint
+- [x] parse `ChatRequest.message` and run single-turn agent execution
+- [x] return iOS-compatible `ChatResponse` envelope:
+  - `message` object with `id`, `role`, `content`, `timestamp`
+  - `requires_confirmation` (default `false`)
+  - `confirmation_reason` (default `null`)
+- [x] return structured error envelopes with `request_id`
+- [ ] enforce hard agent execution timeout with cancellation
+
+---
+
 ## Where the Reviews Agree
 
 Both reviews independently identified the same core gaps. These are high-confidence findings:

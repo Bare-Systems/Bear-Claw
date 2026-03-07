@@ -13,6 +13,7 @@ const channels_mod = @import("channels.zig");
 const peripherals_mod = @import("peripherals.zig");
 const migration_mod = @import("migration.zig");
 const mcp_mod = @import("mcp_client.zig");
+const tardigrade_cmd_mod = @import("tardigrade_cmd.zig");
 
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
@@ -27,7 +28,7 @@ pub fn main() !void {
     if (args.len <= 1) {
         try stdout.print("BearClaw – zero-compromise AI claws, bear edition.\n", .{});
         try stdout.print("Usage: {s} [--api-key <key>] <command> [options]\n", .{args[0]});
-        try stdout.print("Commands: onboard | agent | status | doctor | config | mcp | gateway | daemon | cron | channel | peripheral | migrate\n", .{});
+        try stdout.print("Commands: onboard | agent | status | doctor | config | mcp | gateway | daemon | tardigrade | cron | channel | peripheral | migrate\n", .{});
         return;
     }
 
@@ -161,6 +162,10 @@ pub fn main() !void {
     } else if (std.mem.eql(u8, cmd, "daemon")) {
         const port: u16 = 8080;
         try daemon_mod.runDaemon(allocator, port);
+        return;
+    } else if (std.mem.eql(u8, cmd, "tardigrade")) {
+        const tardi_args = if (args.len > cmd_idx + 1) args[cmd_idx + 1 ..] else &[_][]const u8{};
+        try tardigrade_cmd_mod.run(allocator, args[0], tardi_args);
         return;
     } else if (std.mem.eql(u8, cmd, "cron")) {
         // Pass remaining args after "cron" as subcommand + params.
@@ -449,4 +454,3 @@ fn runDoctor(allocator: std.mem.Allocator, cfg: *const config_mod.Config, stdout
         try stdout.print("Some checks FAILED – see above.\n", .{});
     }
 }
-

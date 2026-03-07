@@ -1,0 +1,42 @@
+name: Release BearClaw
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  release-linux:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.14.1
+
+      - name: Install system deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libsqlite3-dev
+
+      - name: Build release binary
+        run: zig build -Doptimize=ReleaseFast
+
+      - name: Package artifact
+        run: |
+          mkdir -p dist
+          cp zig-out/bin/bareclaw dist/bareclaw
+          tar -C dist -czf bareclaw-linux-x86_64.tar.gz bareclaw
+
+      - name: Publish release assets
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            bareclaw-linux-x86_64.tar.gz
