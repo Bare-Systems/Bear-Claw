@@ -49,7 +49,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Doctor command** — Health diagnostics: workspace write test, config check, API key check, audit log check, cron count.
 - **Enriched status** — `bareclaw status` shows API key status, memory file count, and cron task count.
 - **Interactive CLI channel** — `bareclaw channel loop` starts a full REPL (type `exit` to quit).
-- **OpenClaw migration** — `bareclaw migrate` imports memory from `~/.openclaw/workspace`.
+- **OpenClaw migration** — `bareclaw migrate [source_path]` imports markdown memory entries from `~/.openclaw/workspace/memory/` into BearClaw memory.
 - **Multi-round tool-calling agent loop** — Up to 8 rounds (`MAX_TOOL_ROUNDS`) of tool dispatch per agent turn.
 - **Ollama provider** — Local inference at `http://localhost:11434`, no API key required.
 - **OpenRouter provider** — Meta-router with OpenRouter-specific headers and Bearer auth.

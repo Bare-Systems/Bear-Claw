@@ -8,7 +8,6 @@
 /// Security model for MVP:
 /// - Binds to localhost only (127.0.0.1)
 /// - No auth at this layer; Tardigrade edge enforces auth externally.
-
 const std = @import("std");
 const agent_mod = @import("agent.zig");
 const config_mod = @import("config.zig");
@@ -19,6 +18,7 @@ const tools_mod = @import("tools.zig");
 
 const MAX_REQUEST_BYTES: usize = 256 * 1024;
 const MAX_MESSAGE_CHARS: usize = 4000;
+const AGENT_EXECUTION_TIMEOUT_SECONDS: u64 = 30;
 
 pub fn runGateway(port: u16) !void {
     const stdout = std.io.getStdOut().writer();
@@ -30,18 +30,17 @@ pub fn runGateway(port: u16) !void {
     try stdout.print("BearClaw gateway listening on http://127.0.0.1:{d}\n", .{port});
     try stdout.print("Endpoints: GET /health  POST /webhook  POST /v1/chat\n", .{});
 
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
-
     while (true) {
         const conn = server.accept() catch |err| {
             try stdout.print("accept error: {}\n", .{err});
             continue;
         };
-        handleConnection(allocator, conn) catch |err| {
-            try stdout.print("connection error: {}\n", .{err});
+        const thread = std.Thread.spawn(.{}, handleConnectionThread, .{conn}) catch |err| {
+            try stdout.print("connection thread spawn error: {}\n", .{err});
+            conn.stream.close();
+            continue;
         };
+        thread.detach();
     }
 }
 
@@ -53,10 +52,6 @@ pub fn runGatewayWithShutdown(port: u16, shutdown: *const std.atomic.Value(bool)
     defer server.deinit();
 
     try stdout.print("BearClaw gateway listening on http://127.0.0.1:{d}\n", .{port});
-
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
 
     const fd = server.stream.handle;
     var fds = [_]std.posix.pollfd{.{
@@ -74,8 +69,22 @@ pub fn runGatewayWithShutdown(port: u16, shutdown: *const std.atomic.Value(bool)
         if (shutdown.load(.acquire)) break;
 
         const conn = server.accept() catch continue;
-        handleConnection(allocator, conn) catch {};
+        const thread = std.Thread.spawn(.{}, handleConnectionThread, .{conn}) catch {
+            conn.stream.close();
+            continue;
+        };
+        thread.detach();
     }
+}
+
+fn handleConnectionThread(conn: std.net.Server.Connection) void {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    handleConnection(allocator, conn) catch |err| {
+        std.debug.print("connection error: {}\n", .{err});
+    };
 }
 
 fn handleConnection(allocator: std.mem.Allocator, conn: std.net.Server.Connection) !void {
@@ -134,11 +143,23 @@ fn handleConnection(allocator: std.mem.Allocator, conn: std.net.Server.Connectio
         };
         defer allocator.free(message);
 
-        const reply = runAgentForPrompt(allocator, message) catch {
-            const payload = try std.fmt.allocPrint(allocator, "{{\"code\":\"internal_error\",\"message\":\"agent execution failed\",\"request_id\":\"{s}\"}}", .{request_id});
-            defer allocator.free(payload);
-            try sendJson(conn.stream, "500 Internal Server Error", payload, request_id);
-            return;
+        const reply = runAgentForPromptWithTimeout(allocator, message, AGENT_EXECUTION_TIMEOUT_SECONDS) catch |err| switch (err) {
+            error.AgentTimedOut => {
+                const payload = try std.fmt.allocPrint(
+                    allocator,
+                    "{{\"code\":\"agent_timeout\",\"message\":\"agent timed out after {d} seconds\",\"request_id\":\"{s}\"}}",
+                    .{ AGENT_EXECUTION_TIMEOUT_SECONDS, request_id },
+                );
+                defer allocator.free(payload);
+                try sendJson(conn.stream, "504 Gateway Timeout", payload, request_id);
+                return;
+            },
+            else => {
+                const payload = try std.fmt.allocPrint(allocator, "{{\"code\":\"internal_error\",\"message\":\"agent execution failed\",\"request_id\":\"{s}\"}}", .{request_id});
+                defer allocator.free(payload);
+                try sendJson(conn.stream, "500 Internal Server Error", payload, request_id);
+                return;
+            },
         };
         defer allocator.free(reply);
 
@@ -170,7 +191,11 @@ fn runAgentForPrompt(allocator: std.mem.Allocator, prompt: []const u8) ![]u8 {
     const tools = try tools_mod.buildCoreTools(allocator, &policy, &mem_backend);
     defer tools_mod.freeTools(allocator, tools);
 
-    return agent_mod.runAgentOnceCaptured(
+    var reply_buf = std.ArrayList(u8).init(allocator);
+    errdefer reply_buf.deinit();
+    var reply_writer = reply_buf.writer();
+
+    try agent_mod.runAgentSingleTurnWithTranscript(
         allocator,
         &cfg,
         any_provider,
@@ -179,7 +204,113 @@ fn runAgentForPrompt(allocator: std.mem.Allocator, prompt: []const u8) ![]u8 {
         &policy,
         null,
         prompt,
+        &reply_writer,
     );
+
+    return reply_buf.toOwnedSlice();
+}
+
+const AgentRunJob = struct {
+    mutex: std.Thread.Mutex = .{},
+    cond: std.Thread.Condition = .{},
+    finished: bool = false,
+    caller_timed_out: bool = false,
+    prompt: []u8,
+    reply: ?[]u8 = null,
+    error_name: ?[]u8 = null,
+};
+
+fn runAgentWorker(job: *AgentRunJob) void {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    defer std.heap.page_allocator.free(job.prompt);
+
+    const reply = runAgentForPrompt(allocator, job.prompt) catch |err| {
+        const err_name = std.heap.page_allocator.dupe(u8, @errorName(err)) catch null;
+        finishAgentJob(job, null, err_name);
+        return;
+    };
+    defer allocator.free(reply);
+
+    const reply_copy = std.heap.page_allocator.dupe(u8, reply) catch {
+        const err_name = std.heap.page_allocator.dupe(u8, "OutOfMemory") catch null;
+        finishAgentJob(job, null, err_name);
+        return;
+    };
+    finishAgentJob(job, reply_copy, null);
+}
+
+fn finishAgentJob(job: *AgentRunJob, reply: ?[]u8, error_name: ?[]u8) void {
+    var destroy_job = false;
+
+    job.mutex.lock();
+    job.reply = reply;
+    job.error_name = error_name;
+    job.finished = true;
+    destroy_job = job.caller_timed_out;
+    job.cond.broadcast();
+    job.mutex.unlock();
+
+    if (destroy_job) {
+        if (job.reply) |owned_reply| std.heap.page_allocator.free(owned_reply);
+        if (job.error_name) |owned_error| std.heap.page_allocator.free(owned_error);
+        std.heap.page_allocator.destroy(job);
+    }
+}
+
+fn runAgentForPromptWithTimeout(
+    allocator: std.mem.Allocator,
+    prompt: []const u8,
+    timeout_seconds: u64,
+) ![]u8 {
+    const job = try std.heap.page_allocator.create(AgentRunJob);
+    errdefer std.heap.page_allocator.destroy(job);
+
+    job.* = .{
+        .prompt = try std.heap.page_allocator.dupe(u8, prompt),
+    };
+    errdefer std.heap.page_allocator.free(job.prompt);
+
+    var thread = try std.Thread.spawn(.{}, runAgentWorker, .{job});
+    return awaitAgentJob(allocator, job, &thread, timeout_seconds);
+}
+
+fn awaitAgentJob(
+    allocator: std.mem.Allocator,
+    job: *AgentRunJob,
+    thread: *std.Thread,
+    timeout_seconds: u64,
+) ![]u8 {
+    job.mutex.lock();
+    while (!job.finished) {
+        job.cond.timedWait(&job.mutex, timeout_seconds * std.time.ns_per_s) catch |err| switch (err) {
+            error.Timeout => {
+                job.caller_timed_out = true;
+                job.mutex.unlock();
+                thread.detach();
+                return error.AgentTimedOut;
+            },
+        };
+    }
+
+    job.mutex.unlock();
+    thread.join();
+
+    defer {
+        if (job.reply) |owned_reply| std.heap.page_allocator.free(owned_reply);
+        if (job.error_name) |owned_error| std.heap.page_allocator.free(owned_error);
+        std.heap.page_allocator.destroy(job);
+    }
+
+    if (job.error_name) |err_name| {
+        std.debug.print("agent worker failed: {s}\n", .{err_name});
+        return error.AgentExecutionFailed;
+    }
+
+    const reply = job.reply orelse return error.AgentExecutionFailed;
+    return allocator.dupe(u8, reply);
 }
 
 fn buildChatResponse(allocator: std.mem.Allocator, reply: []const u8) ![]u8 {
@@ -358,4 +489,46 @@ test "buildChatResponse returns envelope" {
 
     try std.testing.expect(std.mem.indexOf(u8, payload, "requires_confirmation") != null);
     try std.testing.expect(std.mem.indexOf(u8, payload, "confirmation_reason") != null);
+}
+
+fn testFastJobWorker(job: *AgentRunJob) void {
+    std.heap.page_allocator.free(job.prompt);
+    const reply = std.heap.page_allocator.dupe(u8, "ok") catch unreachable;
+    finishAgentJob(job, reply, null);
+}
+
+fn testSlowJobWorker(job: *AgentRunJob) void {
+    std.Thread.sleep(20 * std.time.ns_per_ms);
+    std.heap.page_allocator.free(job.prompt);
+    const reply = std.heap.page_allocator.dupe(u8, "late") catch unreachable;
+    finishAgentJob(job, reply, null);
+}
+
+test "awaitAgentJob returns reply before deadline" {
+    const allocator = std.testing.allocator;
+    const job = try std.heap.page_allocator.create(AgentRunJob);
+    errdefer std.heap.page_allocator.destroy(job);
+    job.* = .{
+        .prompt = try std.heap.page_allocator.dupe(u8, ""),
+    };
+    errdefer std.heap.page_allocator.free(job.prompt);
+
+    var thread = try std.Thread.spawn(.{}, testFastJobWorker, .{job});
+    const reply = try awaitAgentJob(allocator, job, &thread, 1);
+    defer allocator.free(reply);
+
+    try std.testing.expectEqualStrings("ok", reply);
+}
+
+test "awaitAgentJob reports timeout for slow worker" {
+    const allocator = std.testing.allocator;
+    const job = try std.heap.page_allocator.create(AgentRunJob);
+    errdefer std.heap.page_allocator.destroy(job);
+    job.* = .{
+        .prompt = try std.heap.page_allocator.dupe(u8, ""),
+    };
+    errdefer std.heap.page_allocator.free(job.prompt);
+
+    var thread = try std.Thread.spawn(.{}, testSlowJobWorker, .{job});
+    try std.testing.expectError(error.AgentTimedOut, awaitAgentJob(allocator, job, &thread, 0));
 }

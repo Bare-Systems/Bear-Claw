@@ -141,9 +141,9 @@ Pin references live in `docs/datasheets/` (to be added). These documents map boa
 
 ---
 
-## 6. Peripheral Config (Planned Schema)
+## 6. Peripheral Config
 
-Future `~/.bareclaw/config.toml` extension for peripherals:
+Supported `~/.bareclaw/config.toml` schema for peripheral listing:
 
 ```toml
 [peripherals]
@@ -172,10 +172,10 @@ baud      = 115200
 
 | Phase | Feature | Status |
 |-------|---------|--------|
-| **P0** | `peripheral list` command (stub) | ✅ Done |
+| **P0** | `peripheral list` command | ✅ Done |
 | **P1** | Serial read/write via `shell` tool | ✅ Works today |
 | **P2** | Raspberry Pi GPIO via `shell` + `raspi-gpio` | ✅ Works today |
-| **P3** | `[peripherals]` config schema | 🔜 Roadmap |
+| **P3** | `[peripherals]` config schema | ✅ Minimal listing support |
 | **P4** | Dedicated `gpio_read`/`gpio_write` tools (no shell fork) | 🔜 Roadmap |
 | **P5** | Native I2C/SPI via Zig FFI (`libgpiod`) | 🔜 Roadmap |
 | **P6** | ESP32 edge-native mode (BearClaw running on ESP32) | 🔜 Roadmap |
@@ -196,7 +196,7 @@ All hardware tool calls go through the same security stack as other tools:
 
 ## 9. References
 
-- `src/peripherals.zig` — current peripheral listing stub
+- `src/peripherals.zig` — peripheral config parsing and listing
 - `src/tools.zig` — `shell` tool (primary hardware interface today)
 - `src/security.zig` — path policy (`/dev/` is in the forbidden path list)
 - [docs/network-deployment.md](./network-deployment.md) — running BearClaw on Raspberry Pi

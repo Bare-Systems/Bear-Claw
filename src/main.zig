@@ -69,7 +69,7 @@ pub fn main() !void {
     } else if (std.mem.eql(u8, cmd, "agent")) {
         // Build provider: use router if fallback_providers is set, else single.
         var single_provider: provider_mod.Provider = undefined;
-        var router:          provider_mod.Router   = undefined;
+        var router: provider_mod.Router = undefined;
         var use_router = false;
 
         const any_provider: provider_mod.AnyProvider = blk: {
@@ -144,7 +144,8 @@ pub fn main() !void {
         else
             "Hello from BearClaw. How can you help me today?";
 
-        try agent_mod.runAgentOnce(
+        var stdout_writer = std.io.getStdOut().writer();
+        try agent_mod.runAgentSingleTurnWithTranscript(
             allocator,
             &cfg,
             any_provider,
@@ -153,6 +154,7 @@ pub fn main() !void {
             &policy,
             if (has_mcp) &mcp_pool else null,
             input,
+            &stdout_writer,
         );
         return;
     } else if (std.mem.eql(u8, cmd, "gateway")) {
@@ -186,7 +188,7 @@ pub fn main() !void {
         }
         return;
     } else if (std.mem.eql(u8, cmd, "peripheral")) {
-        try peripherals_mod.listConfiguredPeripherals();
+        try peripherals_mod.listConfiguredPeripherals(allocator);
         return;
     } else if (std.mem.eql(u8, cmd, "config")) {
         const sub = if (args.len > cmd_idx + 1) args[cmd_idx + 1] else "";
@@ -194,10 +196,12 @@ pub fn main() !void {
             if (args.len < cmd_idx + 4) {
                 try stdout.print("Usage: bareclaw config set <key> <value>\n", .{});
                 try stdout.print("Keys:  default_provider, default_model, memory_backend,\n", .{});
-                try stdout.print("       fallback_providers, api_key, discord_token, telegram_token\n", .{});
+                try stdout.print("       fallback_providers, api_key, discord_token, discord_webhook,\n", .{});
+                try stdout.print("       discord_notify_channel, telegram_token, mcp_servers,\n", .{});
+                try stdout.print("       system_prompt, allowed_paths\n", .{});
                 return;
             }
-            const key   = args[cmd_idx + 2];
+            const key = args[cmd_idx + 2];
             const value = args[cmd_idx + 3];
             if (try cfg.setKey(allocator, key, value)) |err_msg| {
                 defer allocator.free(err_msg);
@@ -216,7 +220,12 @@ pub fn main() !void {
                 try stdout.print("fallback_providers = \"{s}\"\n", .{cfg.fallback_providers});
                 try stdout.print("api_key            = \"{s}\"\n", .{if (cfg.api_key.len > 0) "***" else ""});
                 try stdout.print("discord_token      = \"{s}\"\n", .{if (cfg.discord_token.len > 0) "***" else ""});
+                try stdout.print("discord_webhook    = \"{s}\"\n", .{if (cfg.discord_webhook.len > 0) "***" else ""});
+                try stdout.print("discord_notify_channel = \"{s}\"\n", .{cfg.discord_notify_channel});
                 try stdout.print("telegram_token     = \"{s}\"\n", .{if (cfg.telegram_token.len > 0) "***" else ""});
+                try stdout.print("mcp_servers        = \"{s}\"\n", .{cfg.mcp_servers});
+                try stdout.print("system_prompt      = \"{s}\"\n", .{if (cfg.system_prompt.len > 0) "(custom)" else ""});
+                try stdout.print("allowed_paths      = \"{s}\"\n", .{cfg.allowed_paths});
             } else {
                 try stdout.print("Usage: bareclaw config get  (no key = show all)\n", .{});
             }
@@ -284,8 +293,8 @@ pub fn main() !void {
                 return;
             }
             const server_name = args[cmd_idx + 2];
-            const tool_name   = args[cmd_idx + 3];
-            const call_args   = if (args.len > cmd_idx + 4) args[cmd_idx + 4] else "{}";
+            const tool_name = args[cmd_idx + 3];
+            const call_args = if (args.len > cmd_idx + 4) args[cmd_idx + 4] else "{}";
 
             const server_defs = try config_mod.parseMcpServers(&cfg, allocator);
             defer {
@@ -319,7 +328,8 @@ pub fn main() !void {
         }
         return;
     } else if (std.mem.eql(u8, cmd, "migrate")) {
-        try migration_mod.migrateFromOpenClaw("~/.openclaw/workspace");
+        const source_path = if (args.len > cmd_idx + 1) args[cmd_idx + 1] else "~/.openclaw/workspace";
+        try migration_mod.migrateFromOpenClaw(allocator, source_path);
         return;
     } else {
         try stdout.print("Unknown command: {s}\n", .{cmd});
@@ -339,8 +349,8 @@ fn printStatus(allocator: std.mem.Allocator, cfg: *const config_mod.Config, stdo
     const is_keyless = std.mem.eql(u8, cfg.default_provider, "ollama");
     const has_key = is_keyless or blk: {
         const k = std.process.getEnvVarOwned(allocator, "BARECLAW_API_KEY") catch
-                  std.process.getEnvVarOwned(allocator, "API_KEY") catch
-                  try allocator.dupe(u8, "");
+            std.process.getEnvVarOwned(allocator, "API_KEY") catch
+            try allocator.dupe(u8, "");
         defer allocator.free(k);
         break :blk k.len > 0 or cfg.api_key.len > 0;
     };
@@ -369,10 +379,40 @@ fn printStatus(allocator: std.mem.Allocator, cfg: *const config_mod.Config, stdo
     }
     const enabled_count = blk: {
         var n: usize = 0;
-        for (cron_tasks) |t| { if (t.enabled) n += 1; }
+        for (cron_tasks) |t| {
+            if (t.enabled) n += 1;
+        }
         break :blk n;
     };
     try stdout.print("Cron tasks: {d} total, {d} enabled\n", .{ cron_tasks.len, enabled_count });
+
+    const server_defs = try config_mod.parseMcpServers(cfg, allocator);
+    defer {
+        for (@constCast(server_defs)) |*s| s.deinit(allocator);
+        allocator.free(server_defs);
+    }
+    try stdout.print("MCP:        {d} server(s) configured\n", .{server_defs.len});
+
+    if (peripherals_mod.loadPeripheralSection(allocator, cfg.config_path)) |section_loaded| {
+        var section = section_loaded;
+        defer section.deinit(allocator);
+        const peripheral_status = if (!section.enabled)
+            "disabled"
+        else if (section.boards.len == 0)
+            "enabled, 0 board(s)"
+        else
+            try std.fmt.allocPrint(allocator, "enabled, {d} board(s)", .{section.boards.len});
+        defer if (!std.mem.eql(u8, peripheral_status, "disabled") and !std.mem.eql(u8, peripheral_status, "enabled, 0 board(s)")) allocator.free(peripheral_status);
+        try stdout.print("Peripherals:{s:>18}\n", .{peripheral_status});
+    } else |_| {
+        try stdout.print("Peripherals:{s:>18}\n", .{"config unavailable"});
+    }
+
+    const prompt_status = if (cfg.system_prompt.len > 0) "custom" else "built-in";
+    try stdout.print("Prompt:     {s}\n", .{prompt_status});
+    if (cfg.allowed_paths.len > 0) {
+        try stdout.print("Allowed:    {s}\n", .{cfg.allowed_paths});
+    }
 }
 
 /// Doctor command: check health of key subsystems and report issues.
@@ -413,8 +453,8 @@ fn runDoctor(allocator: std.mem.Allocator, cfg: *const config_mod.Config, stdout
     // 3. API key.
     {
         const k = std.process.getEnvVarOwned(allocator, "BARECLAW_API_KEY") catch
-                  std.process.getEnvVarOwned(allocator, "API_KEY") catch
-                  try allocator.dupe(u8, "");
+            std.process.getEnvVarOwned(allocator, "API_KEY") catch
+            try allocator.dupe(u8, "");
         defer allocator.free(k);
         if (k.len > 0) {
             try stdout.print("  ✓ API key configured\n", .{});
@@ -445,6 +485,85 @@ fn runDoctor(allocator: std.mem.Allocator, cfg: *const config_mod.Config, stdout
             allocator.free(tasks);
         }
         try stdout.print("  ✓ Cron: {d} task(s) configured\n", .{tasks.len});
+    }
+
+    // 6. Peripherals config.
+    {
+        if (peripherals_mod.loadPeripheralSection(allocator, cfg.config_path)) |section_loaded| {
+            var section = section_loaded;
+            defer section.deinit(allocator);
+
+            const issues = try peripherals_mod.validatePeripheralSection(allocator, &section);
+            defer {
+                for (issues) |*issue| @constCast(issue).deinit(allocator);
+                allocator.free(issues);
+            }
+
+            if (!section.enabled) {
+                try stdout.print("  ✓ Peripherals: disabled\n", .{});
+            } else if (section.boards.len == 0) {
+                try stdout.print("  ⚠ Peripherals: enabled but no boards configured\n", .{});
+            } else if (issues.len == 0) {
+                try stdout.print("  ✓ Peripherals: {d} board(s) configured\n", .{section.boards.len});
+            } else {
+                try stdout.print("  ⚠ Peripherals: {d} issue(s) found across {d} board(s)\n", .{ issues.len, section.boards.len });
+                for (issues) |issue| {
+                    try stdout.print("      - board #{d}: {s}\n", .{ issue.index + 1, issue.message });
+                }
+            }
+        } else |err| switch (err) {
+            error.FileNotFound => {
+                try stdout.print("  ⚠ Peripherals: config file missing, skipping peripheral checks\n", .{});
+            },
+            else => {
+                try stdout.print("  ✗ Peripherals config unreadable: {}\n", .{err});
+                all_ok = false;
+            },
+        }
+    }
+
+    // 7. Default OpenClaw migration source.
+    {
+        if (migration_mod.defaultSourceWorkspaceExists(allocator)) {
+            try stdout.print("  ✓ OpenClaw migration source available: {s}\n", .{migration_mod.DEFAULT_OPENCLAW_WORKSPACE});
+        } else {
+            try stdout.print("  ⚠ OpenClaw migration source not found: {s}\n", .{migration_mod.DEFAULT_OPENCLAW_WORKSPACE});
+        }
+    }
+
+    // 8. MCP servers.
+    {
+        const server_defs = try config_mod.parseMcpServers(cfg, allocator);
+        defer {
+            for (@constCast(server_defs)) |*s| s.deinit(allocator);
+            allocator.free(server_defs);
+        }
+
+        if (server_defs.len == 0) {
+            try stdout.print("  ✓ MCP: no servers configured\n", .{});
+        } else {
+            var ok_count: usize = 0;
+            for (server_defs) |def| {
+                var session = mcp_mod.McpSession.startProbe(allocator, def.argv) catch |err| {
+                    try stdout.print("  ⚠ MCP '{s}' probe failed: {}\n", .{ def.name, err });
+                    continue;
+                };
+                defer session.deinit();
+
+                const tools = session.listTools() catch |err| {
+                    try stdout.print("  ⚠ MCP '{s}' tools/list failed: {}\n", .{ def.name, err });
+                    continue;
+                };
+                defer {
+                    for (tools) |*tool| @constCast(tool).deinit(allocator);
+                    allocator.free(tools);
+                }
+
+                ok_count += 1;
+                try stdout.print("  ✓ MCP '{s}': {d} tool(s) discovered\n", .{ def.name, tools.len });
+            }
+            if (ok_count == 0) all_ok = false;
+        }
     }
 
     try stdout.print("\n", .{});

@@ -1,11 +1,16 @@
 const std = @import("std");
+const builtin = @import("builtin");
+const cron_mod = @import("cron.zig");
+const planner_mod = @import("planner.zig");
+const profile_mod = @import("profile.zig");
+const provider_mod = @import("provider.zig");
 const security_mod = @import("security.zig");
 const memory_mod = @import("memory.zig");
 const mcp_mod = @import("mcp_client.zig");
 
 pub const ToolResult = struct {
-    success:   bool,
-    output:    []const u8,
+    success: bool,
+    output: []const u8,
     /// true  → output was heap-allocated; caller must free it.
     /// false → output is a string literal or borrowed slice; do NOT free.
     allocated: bool = false,
@@ -24,9 +29,9 @@ pub const ToolResult = struct {
 };
 
 pub const Tool = struct {
-    name:        []const u8,
+    name: []const u8,
     description: []const u8 = "", // human/LLM-readable description; "" = no description
-    executeFn:   *const fn (ctx: *ToolContext, args_json: []const u8) anyerror!ToolResult,
+    executeFn: *const fn (ctx: *ToolContext, args_json: []const u8) anyerror!ToolResult,
     /// Optional per-tool metadata (e.g. for MCP proxy tools). Owned by the tool registry.
     user_data: ?*anyopaque = null,
 };
@@ -36,6 +41,8 @@ pub const ToolContext = struct {
     policy: *security_mod.SecurityPolicy,
     memory: *memory_mod.MemoryBackend,
     cfg: *const @import("config.zig").Config,
+    provider: ?provider_mod.AnyProvider = null,
+    all_tools: []const Tool = &.{},
     /// Optional MCP session pool, shared across all MCP proxy tool calls in a session.
     mcp_pool: ?*mcp_mod.McpSessionPool = null,
     /// Set by agent.zig dispatch loop to point at the current tool's McpProxyMeta
@@ -53,6 +60,155 @@ fn getString(obj: std.json.Value, field: []const u8) ?[]const u8 {
         .string => |s| s,
         else => null,
     };
+}
+
+pub const TOOL_TIMEOUT_SECONDS: u64 = 30;
+const MAX_SUBPROCESS_OUTPUT_BYTES: usize = 64 * 1024;
+
+const CommandRunResult = struct {
+    term: std.process.Child.Term,
+    stdout: []u8,
+    stderr: []u8,
+};
+
+fn drainPipe(
+    file_opt: *?std.fs.File,
+    out: *std.ArrayList(u8),
+) !void {
+    const file = file_opt.* orelse return;
+    var buf: [4096]u8 = undefined;
+
+    while (true) {
+        const amt = file.read(&buf) catch |err| switch (err) {
+            error.WouldBlock => return,
+            else => return err,
+        };
+        if (amt == 0) {
+            file.close();
+            file_opt.* = null;
+            return;
+        }
+        if (out.items.len + amt > MAX_SUBPROCESS_OUTPUT_BYTES) {
+            return error.StreamTooLong;
+        }
+        try out.appendSlice(buf[0..amt]);
+        if (amt < buf.len) return;
+    }
+}
+
+fn timeoutMessageSeconds(allocator: std.mem.Allocator, seconds: u64) ![]u8 {
+    return std.fmt.allocPrint(allocator, "tool timed out after {d}s", .{seconds});
+}
+
+fn runCommandWithTimeoutSeconds(
+    allocator: std.mem.Allocator,
+    argv: []const []const u8,
+    timeout_seconds: u64,
+) !CommandRunResult {
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) {
+        const result = try std.process.Child.run(.{
+            .allocator = allocator,
+            .argv = argv,
+            .max_output_bytes = MAX_SUBPROCESS_OUTPUT_BYTES,
+        });
+        return .{
+            .term = result.term,
+            .stdout = result.stdout,
+            .stderr = result.stderr,
+        };
+    }
+
+    var child = std.process.Child.init(argv, allocator);
+    child.stdin_behavior = .Ignore;
+    child.stdout_behavior = .Pipe;
+    child.stderr_behavior = .Pipe;
+
+    try child.spawn();
+    errdefer {
+        _ = child.kill() catch {};
+    }
+    try child.waitForSpawn();
+
+    var stdout = std.ArrayList(u8).init(allocator);
+    errdefer stdout.deinit();
+    var stderr = std.ArrayList(u8).init(allocator);
+    errdefer stderr.deinit();
+
+    const deadline_ms = std.time.milliTimestamp() + @as(i64, @intCast(timeout_seconds * 1000));
+
+    while (child.stdout != null or child.stderr != null) {
+        var fds_buf: [2]std.posix.pollfd = undefined;
+        var fd_count: usize = 0;
+        var stdout_idx: ?usize = null;
+        var stderr_idx: ?usize = null;
+
+        if (child.stdout) |file| {
+            stdout_idx = fd_count;
+            fds_buf[fd_count] = .{
+                .fd = file.handle,
+                .events = std.posix.POLL.IN | std.posix.POLL.HUP | std.posix.POLL.ERR,
+                .revents = 0,
+            };
+            fd_count += 1;
+        }
+        if (child.stderr) |file| {
+            stderr_idx = fd_count;
+            fds_buf[fd_count] = .{
+                .fd = file.handle,
+                .events = std.posix.POLL.IN | std.posix.POLL.HUP | std.posix.POLL.ERR,
+                .revents = 0,
+            };
+            fd_count += 1;
+        }
+
+        const now_ms = std.time.milliTimestamp();
+        if (now_ms >= deadline_ms) {
+            _ = child.kill() catch {};
+            if (child.stdout) |*file| {
+                file.close();
+                child.stdout = null;
+            }
+            if (child.stderr) |*file| {
+                file.close();
+                child.stderr = null;
+            }
+            const msg = try timeoutMessageSeconds(allocator, timeout_seconds);
+            errdefer allocator.free(msg);
+            return .{
+                .term = .{ .Signal = 15 },
+                .stdout = msg,
+                .stderr = try allocator.dupe(u8, ""),
+            };
+        }
+
+        const remaining_ms: i32 = @intCast(@min(deadline_ms - now_ms, @as(i64, std.math.maxInt(i32))));
+        _ = try std.posix.poll(fds_buf[0..fd_count], remaining_ms);
+
+        if (stdout_idx) |idx| {
+            if (fds_buf[idx].revents != 0) {
+                try drainPipe(&child.stdout, &stdout);
+            }
+        }
+        if (stderr_idx) |idx| {
+            if (fds_buf[idx].revents != 0) {
+                try drainPipe(&child.stderr, &stderr);
+            }
+        }
+    }
+
+    const term = try child.wait();
+    return .{
+        .term = term,
+        .stdout = try stdout.toOwnedSlice(),
+        .stderr = try stderr.toOwnedSlice(),
+    };
+}
+
+fn runCommandWithTimeout(
+    allocator: std.mem.Allocator,
+    argv: []const []const u8,
+) !CommandRunResult {
+    return runCommandWithTimeoutSeconds(allocator, argv, TOOL_TIMEOUT_SECONDS);
 }
 
 // ── tool: shell ───────────────────────────────────────────────────────────────
@@ -79,18 +235,14 @@ fn runShellCmd(ctx: *ToolContext, cmd: []const u8) !ToolResult {
     }
     ctx.policy.auditLog("shell", cmd) catch {};
 
-    const result = std.process.Child.run(.{
-        .allocator = ctx.allocator,
-        .argv = &[_][]const u8{ "/bin/sh", "-c", cmd },
-    }) catch |err| {
+    const result = runCommandWithTimeout(ctx.allocator, &[_][]const u8{ "/bin/sh", "-c", cmd }) catch |err| {
         const msg = try std.fmt.allocPrint(ctx.allocator, "shell exec failed: {}", .{err});
         return ToolResult.owned(false, msg);
     };
     defer ctx.allocator.free(result.stdout);
     defer ctx.allocator.free(result.stderr);
 
-    const output = try capOutput(ctx.allocator,
-        if (result.stdout.len > 0) result.stdout else result.stderr);
+    const output = try capOutput(ctx.allocator, if (result.stdout.len > 0) result.stdout else result.stderr);
     return ToolResult.owned(result.term == .Exited and result.term.Exited == 0, output);
 }
 
@@ -107,11 +259,11 @@ fn toolShell(ctx: *ToolContext, args_json: []const u8) !ToolResult {
 
     // Try "command" then "cmd" — both are accepted.
     const val = parsed.value.object.get("command") orelse
-                parsed.value.object.get("cmd");
+        parsed.value.object.get("cmd");
 
     switch (val orelse return runShellCmd(ctx, "echo \"no command provided\"")) {
         .string => |s| return runShellCmd(ctx, s),
-        .array  => |arr| {
+        .array => |arr| {
             const joined = try joinCmdArray(ctx.allocator, arr);
             defer ctx.allocator.free(joined);
             return runShellCmd(ctx, joined);
@@ -258,6 +410,119 @@ fn toolMemoryForget(ctx: *ToolContext, args_json: []const u8) !ToolResult {
     return ToolResult.owned(true, msg);
 }
 
+// ── tool: profile_get / profile_set ─────────────────────────────────────────
+
+fn toolProfileGet(ctx: *ToolContext, args_json: []const u8) !ToolResult {
+    const parsed = std.json.parseFromSlice(std.json.Value, ctx.allocator, args_json, .{}) catch {
+        return ToolResult.literal(false, "invalid JSON in profile_get args");
+    };
+    defer parsed.deinit();
+
+    const key = getString(parsed.value, "key") orelse {
+        return ToolResult.literal(false, "profile_get: missing 'key' argument");
+    };
+
+    ctx.policy.auditLog("profile_get", key) catch {};
+
+    const value = try profile_mod.getValue(ctx.allocator, ctx.cfg.workspace_dir, key);
+    if (value) |v| {
+        return ToolResult.owned(true, v);
+    }
+    return ToolResult.literal(true, "(profile key not set)");
+}
+
+fn toolProfileSet(ctx: *ToolContext, args_json: []const u8) !ToolResult {
+    const parsed = std.json.parseFromSlice(std.json.Value, ctx.allocator, args_json, .{}) catch {
+        return ToolResult.literal(false, "invalid JSON in profile_set args");
+    };
+    defer parsed.deinit();
+
+    const key = getString(parsed.value, "key") orelse {
+        return ToolResult.literal(false, "profile_set: missing 'key' argument");
+    };
+    const value = getString(parsed.value, "value") orelse {
+        return ToolResult.literal(false, "profile_set: missing 'value' argument");
+    };
+
+    ctx.policy.auditLog("profile_set", key) catch {};
+
+    try profile_mod.setValue(ctx.allocator, ctx.cfg.workspace_dir, key, value);
+    const msg = try std.fmt.allocPrint(ctx.allocator, "profile '{s}' updated", .{key});
+    return ToolResult.owned(true, msg);
+}
+
+// ── tool: planner_execute ───────────────────────────────────────────────────
+
+const PlannerExecuteCtx = struct {
+    tool_ctx: *ToolContext,
+};
+
+fn plannerExecuteStep(ctx_ptr: *anyopaque, tool_name: []const u8, args_json: []const u8) !planner_mod.ExecutionResult {
+    const exec_ctx: *PlannerExecuteCtx = @ptrCast(@alignCast(ctx_ptr));
+
+    if (std.mem.eql(u8, tool_name, "planner_execute")) {
+        return planner_mod.ExecutionResult.literal(false, "planner_execute cannot call itself");
+    }
+
+    for (exec_ctx.tool_ctx.all_tools) |tool| {
+        if (!std.mem.eql(u8, tool.name, tool_name)) continue;
+
+        exec_ctx.tool_ctx.mcp_current_meta = tool.user_data;
+        defer exec_ctx.tool_ctx.mcp_current_meta = null;
+
+        const result = tool.executeFn(exec_ctx.tool_ctx, args_json) catch |err| {
+            const msg = try std.fmt.allocPrint(exec_ctx.tool_ctx.allocator, "tool error: {}", .{err});
+            return planner_mod.ExecutionResult.owned(false, msg);
+        };
+        return .{
+            .success = result.success,
+            .output = result.output,
+            .allocated = result.allocated,
+        };
+    }
+
+    return planner_mod.ExecutionResult.literal(false, "unknown tool");
+}
+
+fn toolPlannerExecute(ctx: *ToolContext, args_json: []const u8) !ToolResult {
+    const parsed = std.json.parseFromSlice(std.json.Value, ctx.allocator, args_json, .{}) catch {
+        return ToolResult.literal(false, "invalid JSON in planner_execute args");
+    };
+    defer parsed.deinit();
+
+    const goal = getString(parsed.value, "goal") orelse getString(parsed.value, "prompt") orelse {
+        return ToolResult.literal(false, "planner_execute: missing 'goal' argument");
+    };
+
+    const provider = ctx.provider orelse {
+        return ToolResult.literal(false, "planner_execute: no provider is active in this tool context");
+    };
+
+    ctx.policy.auditLog("planner_execute", goal) catch {};
+
+    var descriptors = std.ArrayList(planner_mod.ToolDescriptor).init(ctx.allocator);
+    defer descriptors.deinit();
+    for (ctx.all_tools) |tool| {
+        try descriptors.append(.{
+            .name = tool.name,
+            .description = tool.description,
+        });
+    }
+
+    var exec_ctx = PlannerExecuteCtx{ .tool_ctx = ctx };
+    const summary = try planner_mod.planAndExecute(
+        ctx.allocator,
+        provider,
+        ctx.cfg.default_model,
+        ctx.memory,
+        descriptors.items,
+        &exec_ctx,
+        plannerExecuteStep,
+        goal,
+    );
+    return ToolResult.owned(true, summary);
+}
+
 // ── tool: http_request ────────────────────────────────────────────────────────
 
 fn toolHttpRequest(ctx: *ToolContext, args_json: []const u8) !ToolResult {
@@ -276,7 +541,7 @@ fn toolHttpRequest(ctx: *ToolContext, args_json: []const u8) !ToolResult {
 
     ctx.policy.auditLog("http_request", url_str) catch {};
 
-    const uri = std.Uri.parse(url_str) catch {
+    _ = std.Uri.parse(url_str) catch {
         const msg = try std.fmt.allocPrint(ctx.allocator, "http_request: invalid URL '{s}'", .{url_str});
         return ToolResult.owned(false, msg);
     };
@@ -286,38 +551,155 @@ fn toolHttpRequest(ctx: *ToolContext, args_json: []const u8) !ToolResult {
     else
         .GET;
 
-    var client = std.http.Client{ .allocator = ctx.allocator };
+    const output = runHttpRequestWithTimeout(ctx.allocator, url_str, method, body_str, TOOL_TIMEOUT_SECONDS) catch |err| switch (err) {
+        error.ToolTimedOut => {
+            const msg = try timeoutMessageSeconds(ctx.allocator, TOOL_TIMEOUT_SECONDS);
+            return ToolResult.owned(false, msg);
+        },
+        else => {
+            const msg = try std.fmt.allocPrint(ctx.allocator, "http_request failed: {}", .{err});
+            return ToolResult.owned(false, msg);
+        },
+    };
+    errdefer ctx.allocator.free(output);
+
+    if (std.mem.startsWith(u8, output, "HTTP ")) {
+        return ToolResult.owned(false, output);
+    }
+
+    return ToolResult.owned(true, output);
+}
+
+const HttpRequestJob = struct {
+    mutex: std.Thread.Mutex = .{},
+    cond: std.Thread.Condition = .{},
+    finished: bool = false,
+    caller_timed_out: bool = false,
+    url: []u8,
+    body: []u8,
+    method: std.http.Method,
+    output: ?[]u8 = null,
+    error_name: ?[]u8 = null,
+};
+
+fn runHttpRequestWithTimeout(
+    allocator: std.mem.Allocator,
+    url: []const u8,
+    method: std.http.Method,
+    body: []const u8,
+    timeout_seconds: u64,
+) ![]u8 {
+    const job = try std.heap.page_allocator.create(HttpRequestJob);
+    errdefer std.heap.page_allocator.destroy(job);
+
+    job.* = .{
+        .url = try std.heap.page_allocator.dupe(u8, url),
+        .body = try std.heap.page_allocator.dupe(u8, body),
+        .method = method,
+    };
+    errdefer {
+        std.heap.page_allocator.free(job.url);
+        std.heap.page_allocator.free(job.body);
+    }
+
+    var thread = try std.Thread.spawn(.{}, httpRequestWorker, .{job});
+    return awaitHttpRequestJob(allocator, job, &thread, timeout_seconds);
+}
+
+fn httpRequestWorker(job: *HttpRequestJob) void {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    defer std.heap.page_allocator.free(job.url);
+    defer std.heap.page_allocator.free(job.body);
+
+    const output = runHttpRequest(allocator, job.url, job.method, job.body) catch |err| {
+        const err_name = std.heap.page_allocator.dupe(u8, @errorName(err)) catch null;
+        finishHttpRequestJob(job, null, err_name);
+        return;
+    };
+    finishHttpRequestJob(job, output, null);
+}
+
+fn runHttpRequest(
+    allocator: std.mem.Allocator,
+    url: []const u8,
+    method: std.http.Method,
+    body: []const u8,
+) ![]u8 {
+    const uri = try std.Uri.parse(url);
+
+    var client = std.http.Client{ .allocator = allocator };
     defer client.deinit();
 
-    var response_buf = std.ArrayList(u8).init(ctx.allocator);
+    var response_buf = std.ArrayList(u8).init(allocator);
     errdefer response_buf.deinit();
 
-    const payload: ?[]const u8 = if (body_str.len > 0) body_str else null;
+    const payload: ?[]const u8 = if (body.len > 0) body else null;
 
-    const result = client.fetch(.{
+    const result = try client.fetch(.{
         .method = method,
         .location = .{ .uri = uri },
         .payload = payload,
         .response_storage = .{ .dynamic = &response_buf },
-    }) catch |err| {
-        const msg = try std.fmt.allocPrint(ctx.allocator, "http_request failed: {}", .{err});
-        return ToolResult.owned(false, msg);
-    };
+    });
 
-    const success = @intFromEnum(result.status) < 400;
-    const output = try response_buf.toOwnedSlice();
+    const raw = try response_buf.toOwnedSlice();
+    if (@intFromEnum(result.status) < 400) return raw;
+    defer allocator.free(raw);
+    return std.fmt.allocPrint(allocator, "HTTP {d}: {s}", .{ @intFromEnum(result.status), raw });
+}
 
-    if (!success) {
-        const msg = try std.fmt.allocPrint(
-            ctx.allocator,
-            "HTTP {d}: {s}",
-            .{ @intFromEnum(result.status), output },
-        );
-        ctx.allocator.free(output);
-        return ToolResult.owned(false, msg);
+fn finishHttpRequestJob(job: *HttpRequestJob, output: ?[]u8, error_name: ?[]u8) void {
+    var destroy_job = false;
+
+    job.mutex.lock();
+    job.output = output;
+    job.error_name = error_name;
+    job.finished = true;
+    destroy_job = job.caller_timed_out;
+    job.cond.broadcast();
+    job.mutex.unlock();
+
+    if (destroy_job) {
+        if (job.output) |owned_output| std.heap.page_allocator.free(owned_output);
+        if (job.error_name) |owned_error| std.heap.page_allocator.free(owned_error);
+        std.heap.page_allocator.destroy(job);
+    }
+}
+
+fn awaitHttpRequestJob(
+    allocator: std.mem.Allocator,
+    job: *HttpRequestJob,
+    thread: *std.Thread,
+    timeout_seconds: u64,
+) ![]u8 {
+    job.mutex.lock();
+    while (!job.finished) {
+        job.cond.timedWait(&job.mutex, timeout_seconds * std.time.ns_per_s) catch |err| switch (err) {
+            error.Timeout => {
+                job.caller_timed_out = true;
+                job.mutex.unlock();
+                thread.detach();
+                return error.ToolTimedOut;
+            },
+        };
     }
 
-    return ToolResult.owned(true, output);
+    job.mutex.unlock();
+    thread.join();
+
+    defer {
+        if (job.output) |owned_output| std.heap.page_allocator.free(owned_output);
+        if (job.error_name) |owned_error| std.heap.page_allocator.free(owned_error);
+        std.heap.page_allocator.destroy(job);
+    }
+
+    if (job.error_name) |_| return error.HttpRequestFailed;
+
+    const output = job.output orelse return error.HttpRequestFailed;
+    return allocator.dupe(u8, output);
 }
 
 // ── T1-2: Tool output size cap ────────────────────────────────────────────────
@@ -351,18 +733,21 @@ fn toolGitOperations(ctx: *ToolContext, args_json: []const u8) !ToolResult {
     };
     defer parsed.deinit();
 
-    const op    = getString(parsed.value, "op")   orelse "status";
-    const path  = getString(parsed.value, "path") orelse ".";
+    const op = getString(parsed.value, "op") orelse "status";
+    const path = getString(parsed.value, "path") orelse ".";
     const extra = getString(parsed.value, "args") orelse "";
 
     // Validate allowed operations.
     const allowed_ops = [_][]const u8{
-        "status", "log", "diff", "add", "commit", "push", "pull",
-        "clone", "init", "branch", "checkout", "fetch", "stash",
+        "status", "log",  "diff",   "add",      "commit", "push",  "pull",
+        "clone",  "init", "branch", "checkout", "fetch",  "stash",
     };
     var op_ok = false;
     for (allowed_ops) |allowed| {
-        if (std.mem.eql(u8, op, allowed)) { op_ok = true; break; }
+        if (std.mem.eql(u8, op, allowed)) {
+            op_ok = true;
+            break;
+        }
     }
     if (!op_ok) {
         return ToolResult.literal(false, "git_operations: unsupported operation");
@@ -393,10 +778,7 @@ fn toolGitOperations(ctx: *ToolContext, args_json: []const u8) !ToolResult {
         }
     }
 
-    const result = std.process.Child.run(.{
-        .allocator = ctx.allocator,
-        .argv      = argv.items,
-    }) catch |err| {
+    const result = runCommandWithTimeout(ctx.allocator, argv.items) catch |err| {
         const msg = try std.fmt.allocPrint(ctx.allocator, "git exec failed: {}", .{err});
         return ToolResult.owned(false, msg);
     };
@@ -512,11 +894,26 @@ fn toolAgentStatus(ctx: *ToolContext, _: []const u8) !ToolResult {
         }
     } else |_| {}
 
+    const cron_tasks = cron_mod.loadTasksPublic(ctx.allocator) catch &[_]cron_mod.CronTask{};
+    defer {
+        for (cron_tasks) |*task| @constCast(task).deinit(ctx.allocator);
+        ctx.allocator.free(cron_tasks);
+    }
+
+    var tool_names = std.ArrayList(u8).init(ctx.allocator);
+    errdefer tool_names.deinit();
+    for (ctx.all_tools, 0..) |tool, idx| {
+        if (idx > 0) try tool_names.appendSlice(", ");
+        try tool_names.appendSlice(tool.name);
+    }
+    const loaded_tools = if (tool_names.items.len > 0) tool_names.items else "(none)";
+
     const out = try std.fmt.allocPrint(
         ctx.allocator,
-        "workspace: {s}\nmemory_entries: {d}\npolicy: workspace-only sandbox",
-        .{ ctx.policy.workspace_dir, mem_count },
+        "workspace: {s}\nprovider: {s}\nmodel: {s}\nmemory_entries: {d}\ncron_tasks: {d}\nloaded_tools: {s}\npolicy: workspace-only sandbox",
+        .{ ctx.policy.workspace_dir, ctx.cfg.default_provider, ctx.cfg.default_model, mem_count, cron_tasks.len, loaded_tools },
     );
+    tool_names.deinit();
     return ToolResult.owned(true, out);
 }
 
@@ -592,16 +989,14 @@ fn toolAuditLogRead(ctx: *ToolContext, args_json: []const u8) !ToolResult {
 
 fn toolDiscordNotify(ctx: *ToolContext, args_json: []const u8) !ToolResult {
     const channel_id = ctx.cfg.discord_notify_channel;
-    const bot_token  = ctx.cfg.discord_token;
+    const bot_token = ctx.cfg.discord_token;
 
     if (channel_id.len == 0) {
-        return ToolResult.literal(false,
-            "discord_notify: discord_notify_channel is not configured. " ++
+        return ToolResult.literal(false, "discord_notify: discord_notify_channel is not configured. " ++
             "Run: bareclaw config set discord_notify_channel \"<channel_id>\"");
     }
     if (bot_token.len == 0) {
-        return ToolResult.literal(false,
-            "discord_notify: discord_token is not configured.");
+        return ToolResult.literal(false, "discord_notify: discord_token is not configured.");
     }
 
     const parsed = std.json.parseFromSlice(std.json.Value, ctx.allocator, args_json, .{}) catch
@@ -646,7 +1041,7 @@ fn toolDiscordNotify(ctx: *ToolContext, args_json: []const u8) !ToolResult {
         .location = .{ .uri = uri },
         .payload = body_buf.items,
         .extra_headers = &[_]std.http.Header{
-            .{ .name = "Content-Type",  .value = "application/json" },
+            .{ .name = "Content-Type", .value = "application/json" },
             .{ .name = "Authorization", .value = auth_header },
         },
         .response_storage = .{ .dynamic = &response_buf },
@@ -661,7 +1056,8 @@ fn toolDiscordNotify(ctx: *ToolContext, args_json: []const u8) !ToolResult {
     }
 
     const msg = try std.fmt.allocPrint(
-        ctx.allocator, "discord_notify: Discord API returned HTTP {d}: {s}",
+        ctx.allocator,
+        "discord_notify: Discord API returned HTTP {d}: {s}",
         .{ status, response_buf.items },
     );
     return ToolResult.owned(false, msg);
@@ -738,23 +1134,26 @@ pub fn buildCoreTools(
     var list = std.ArrayList(Tool).init(allocator);
     errdefer list.deinit();
 
-    try list.append(Tool{ .name = "shell",                .description = "Run a shell command. Args: {\"command\": \"<shell string>\"}",  .executeFn = toolShell });
-    try list.append(Tool{ .name = "file_read",            .description = "Read a file from the workspace",                        .executeFn = toolFileRead });
-    try list.append(Tool{ .name = "file_write",           .description = "Write content to a file in the workspace",              .executeFn = toolFileWrite });
-    try list.append(Tool{ .name = "memory_store",         .description = "Store a value in memory by key",                       .executeFn = toolMemoryStore });
-    try list.append(Tool{ .name = "memory_recall",        .description = "Recall a stored memory entry by key",                  .executeFn = toolMemoryRecall });
-    try list.append(Tool{ .name = "memory_forget",        .description = "Delete a stored memory entry by key",                  .executeFn = toolMemoryForget });
-    try list.append(Tool{ .name = "memory_list_keys",     .description = "List all memory entry keys",                           .executeFn = toolMemoryListKeys });
-    try list.append(Tool{ .name = "memory_delete_prefix", .description = "Delete all memory entries whose key starts with prefix",.executeFn = toolMemoryDeletePrefix });
-    try list.append(Tool{ .name = "http_request",         .description = "Make a GET or POST HTTP request",                      .executeFn = toolHttpRequest });
-    try list.append(Tool{ .name = "git_operations",       .description = "Run a git subcommand in the workspace",                 .executeFn = toolGitOperations });
-    try list.append(Tool{ .name = "agent_status",         .description = "Return agent runtime status (workspace, memory count)", .executeFn = toolAgentStatus });
-    try list.append(Tool{ .name = "audit_log_read",       .description = "Read the last N lines of the audit log",               .executeFn = toolAuditLogRead });
-    try list.append(Tool{ .name = "discord_notify",       .description = "Send a message to the user on Discord via webhook. Args: {\"message\":\"text\"}.", .executeFn = toolDiscordNotify });
-    try list.append(Tool{ .name = "cron_list",            .description = "List all scheduled cron tasks",                        .executeFn = toolCronList });
-    try list.append(Tool{ .name = "cron_add_prompt",      .description = "Schedule a recurring agent-prompt task. The prompt MUST end with 'then use discord_notify to send the result to the user'. Args: {\"schedule\":\"0 9 * * *\",\"prompt\":\"...then use discord_notify to send the result to the user\"}", .executeFn = toolCronAddPrompt });
-    try list.append(Tool{ .name = "cron_remove",          .description = "Remove a cron task by ID. Args: {\"id\":\"t1\"}",      .executeFn = toolCronRemove });
-    try list.append(Tool{ .name = "cron_run",             .description = "Manually trigger all due cron tasks now. Use this to test a scheduled task immediately. Args: {}", .executeFn = toolCronRun });
+    try list.append(Tool{ .name = "shell", .description = "Run a shell command. Args: {\"command\": \"<shell string>\"}", .executeFn = toolShell });
+    try list.append(Tool{ .name = "file_read", .description = "Read a file from the workspace", .executeFn = toolFileRead });
+    try list.append(Tool{ .name = "file_write", .description = "Write content to a file in the workspace", .executeFn = toolFileWrite });
+    try list.append(Tool{ .name = "memory_store", .description = "Store a value in memory by key", .executeFn = toolMemoryStore });
+    try list.append(Tool{ .name = "memory_recall", .description = "Recall a stored memory entry by key", .executeFn = toolMemoryRecall });
+    try list.append(Tool{ .name = "memory_forget", .description = "Delete a stored memory entry by key", .executeFn = toolMemoryForget });
+    try list.append(Tool{ .name = "profile_get", .description = "Read a user profile value by key", .executeFn = toolProfileGet });
+    try list.append(Tool{ .name = "profile_set", .description = "Set a user profile value by key", .executeFn = toolProfileSet });
+    try list.append(Tool{ .name = "planner_execute", .description = "Create a multi-step plan, execute tools, and store a reflective summary. Args: {\"goal\":\"...\"}", .executeFn = toolPlannerExecute });
+    try list.append(Tool{ .name = "memory_list_keys", .description = "List all memory entry keys", .executeFn = toolMemoryListKeys });
+    try list.append(Tool{ .name = "memory_delete_prefix", .description = "Delete all memory entries whose key starts with prefix", .executeFn = toolMemoryDeletePrefix });
+    try list.append(Tool{ .name = "http_request", .description = "Make a GET or POST HTTP request", .executeFn = toolHttpRequest });
+    try list.append(Tool{ .name = "git_operations", .description = "Run a git subcommand in the workspace", .executeFn = toolGitOperations });
+    try list.append(Tool{ .name = "agent_status", .description = "Return agent runtime status (provider, model, memory count, loaded tools, cron count)", .executeFn = toolAgentStatus });
+    try list.append(Tool{ .name = "audit_log_read", .description = "Read the last N lines of the audit log", .executeFn = toolAuditLogRead });
+    try list.append(Tool{ .name = "discord_notify", .description = "Send a message to the user on Discord via webhook. Args: {\"message\":\"text\"}.", .executeFn = toolDiscordNotify });
+    try list.append(Tool{ .name = "cron_list", .description = "List all scheduled cron tasks", .executeFn = toolCronList });
+    try list.append(Tool{ .name = "cron_add_prompt", .description = "Schedule a recurring agent-prompt task. The prompt MUST end with 'then use discord_notify to send the result to the user'. Args: {\"schedule\":\"0 9 * * *\",\"prompt\":\"...then use discord_notify to send the result to the user\"}", .executeFn = toolCronAddPrompt });
+    try list.append(Tool{ .name = "cron_remove", .description = "Remove a cron task by ID. Args: {\"id\":\"t1\"}", .executeFn = toolCronRemove });
+    try list.append(Tool{ .name = "cron_run", .description = "Manually trigger all due cron tasks now. Use this to test a scheduled task immediately. Args: {}", .executeFn = toolCronRun });
 
     return list.toOwnedSlice();
 }
@@ -833,7 +1232,7 @@ fn toolMcpProxy(ctx: *ToolContext, args_json: []const u8) !ToolResult {
 
 pub const McpStartupError = struct {
     server_name: []const u8, // owned
-    message:     []const u8, // owned
+    message: []const u8, // owned
 
     pub fn deinit(self: *McpStartupError, allocator: std.mem.Allocator) void {
         allocator.free(self.server_name);
@@ -856,8 +1255,8 @@ pub fn buildMcpTools(
 ) ![]Tool {
     pool_out.* = mcp_mod.McpSessionPool.init(allocator);
 
-    var list   = std.ArrayList(Tool).init(allocator);
-    var errs   = std.ArrayList(McpStartupError).init(allocator);
+    var list = std.ArrayList(Tool).init(allocator);
+    var errs = std.ArrayList(McpStartupError).init(allocator);
     errdefer list.deinit();
     errdefer {
         for (errs.items) |*e| e.deinit(allocator);
@@ -872,7 +1271,7 @@ pub fn buildMcpTools(
             const msg = std.fmt.allocPrint(allocator, "{}", .{err}) catch "unknown error";
             try errs.append(McpStartupError{
                 .server_name = try allocator.dupe(u8, def.name),
-                .message     = msg,
+                .message = msg,
             });
             continue;
         };
@@ -899,16 +1298,16 @@ pub fn buildMcpTools(
 
             const meta = try allocator.create(McpProxyMeta);
             meta.* = McpProxyMeta{
-                .server_argv   = argv_copy,
+                .server_argv = argv_copy,
                 .mcp_tool_name = try allocator.dupe(u8, mcp_tool.name),
-                .description   = desc_copy,
+                .description = desc_copy,
             };
 
             try list.append(Tool{
-                .name        = tool_name,
+                .name = tool_name,
                 .description = meta.description, // points into meta — freed via freeMcpTools
-                .executeFn   = toolMcpProxy,
-                .user_data   = @ptrCast(meta),
+                .executeFn = toolMcpProxy,
+                .user_data = @ptrCast(meta),
             });
         }
 
@@ -932,4 +1331,83 @@ pub fn freeMcpTools(allocator: std.mem.Allocator, tools: []Tool) void {
         allocator.free(tool.name);
     }
     allocator.free(tools);
+}
+
+test "runCommandWithTimeout captures stdout before exit" {
+    const result = try runCommandWithTimeout(std.testing.allocator, &[_][]const u8{
+        "/bin/sh",
+        "-c",
+        "printf 'ok'",
+    });
+    defer std.testing.allocator.free(result.stdout);
+    defer std.testing.allocator.free(result.stderr);
+
+    try std.testing.expect(result.term == .Exited);
+    try std.testing.expectEqualStrings("ok", result.stdout);
+    try std.testing.expectEqualStrings("", result.stderr);
+}
+
+test "runCommandWithTimeout returns timeout message for sleeping process" {
+    const result = try runCommandWithTimeoutSeconds(std.testing.allocator, &[_][]const u8{
+        "/bin/sh",
+        "-c",
+        "sleep 2",
+    }, 1);
+    defer std.testing.allocator.free(result.stdout);
+    defer std.testing.allocator.free(result.stderr);
+
+    try std.testing.expect(std.mem.indexOf(u8, result.stdout, "tool timed out after") != null);
+    try std.testing.expectEqualStrings("", result.stderr);
+}
+
+fn testFastHttpJobWorker(job: *HttpRequestJob) void {
+    std.heap.page_allocator.free(job.url);
+    std.heap.page_allocator.free(job.body);
+    const output = std.heap.page_allocator.dupe(u8, "ok") catch unreachable;
+    finishHttpRequestJob(job, output, null);
+}
+
+fn testSlowHttpJobWorker(job: *HttpRequestJob) void {
+    std.Thread.sleep(20 * std.time.ns_per_ms);
+    std.heap.page_allocator.free(job.url);
+    std.heap.page_allocator.free(job.body);
+    const output = std.heap.page_allocator.dupe(u8, "late") catch unreachable;
+    finishHttpRequestJob(job, output, null);
+}
+
+test "awaitHttpRequestJob returns output before deadline" {
+    const job = try std.heap.page_allocator.create(HttpRequestJob);
+    errdefer std.heap.page_allocator.destroy(job);
+    job.* = .{
+        .url = try std.heap.page_allocator.dupe(u8, ""),
+        .body = try std.heap.page_allocator.dupe(u8, ""),
+        .method = .GET,
+    };
+    errdefer {
+        std.heap.page_allocator.free(job.url);
+        std.heap.page_allocator.free(job.body);
+    }
+
+    var thread = try std.Thread.spawn(.{}, testFastHttpJobWorker, .{job});
+    const output = try awaitHttpRequestJob(std.testing.allocator, job, &thread, 1);
+    defer std.testing.allocator.free(output);
+
+    try std.testing.expectEqualStrings("ok", output);
+}
+
+test "awaitHttpRequestJob reports timeout for slow worker" {
+    const job = try std.heap.page_allocator.create(HttpRequestJob);
+    errdefer std.heap.page_allocator.destroy(job);
+    job.* = .{
+        .url = try std.heap.page_allocator.dupe(u8, ""),
+        .body = try std.heap.page_allocator.dupe(u8, ""),
+        .method = .GET,
+    };
+    errdefer {
+        std.heap.page_allocator.free(job.url);
+        std.heap.page_allocator.free(job.body);
+    }
+
+    var thread = try std.Thread.spawn(.{}, testSlowHttpJobWorker, .{job});
+    try std.testing.expectError(error.ToolTimedOut, awaitHttpRequestJob(std.testing.allocator, job, &thread, 0));
 }

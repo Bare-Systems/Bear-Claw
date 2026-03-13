@@ -163,8 +163,8 @@ bareclaw <command> [options]
 | `gateway` | Start HTTP gateway on port 8080 |
 | `daemon` | Start gateway + cron runner together |
 | `tardigrade` | Start BearClaw gateway + Tardigrade edge together |
-| `peripheral` | List configured hardware peripherals |
-| `migrate` | Import workspace from OpenClaw (`~/.openclaw/workspace`) |
+| `peripheral` | List configured hardware peripherals from `[peripherals]` config |
+| `migrate [source_path]` | Import markdown memory entries from OpenClaw (default: `~/.openclaw/workspace`) |
 
 ---
 
@@ -326,6 +326,14 @@ BearClaw stores persistent memory as Markdown files under `~/.bareclaw/workspace
 Each `memory_store` call writes `<key>.md`. `memory_recall` reads it back. `memory_forget` deletes it.
 
 The agent automatically stores the last user message as `last_message` after each successful turn.
+Interactive sessions and single-turn agent runs also store a transcript under
+`session/YYYY-MM-DDTHH:MM`, and cron agent-prompt runs store results under
+`cron/<task_id>/<timestamp>`.
+User preferences can be stored separately in `profile.md` via the `profile_get`
+and `profile_set` tools, and the agent now incorporates that profile into the
+system prompt when present. Planner runs also store reflective summaries under
+`reflection/<timestamp>` and refresh `reflection/latest`, which is loaded back
+into future prompts as lightweight guidance.
 
 ```bash
 # View your memory files directly
@@ -333,6 +341,35 @@ ls ~/.bareclaw/workspace/memory/
 ```
 
 The `status` command shows a count of stored memory files.
+
+## Planner
+
+BearClaw now includes a planner/reflector path via the `planner_execute` tool.
+When the agent chooses that tool, it:
+- asks the model for a structured tool plan
+- executes the planned steps one by one
+- reflects after each step to decide whether to continue, stop, or append work
+- stores a final reflective summary in memory for future sessions
+
+This is primarily meant for higher-level goals that benefit from explicit
+multi-step execution instead of a single tool-calling turn.
+
+## Migration
+
+`bareclaw migrate` imports Markdown memory entries from an OpenClaw workspace
+into BearClaw's `memory/` directory. By default it reads
+`~/.openclaw/workspace/memory/**/*.md` and preserves nested key paths.
+
+```bash
+# Import from the default OpenClaw workspace
+bareclaw migrate
+
+# Import from a different exported workspace path
+bareclaw migrate /tmp/openclaw-workspace
+```
+
+`bareclaw doctor` now also checks whether configured peripherals are structurally
+valid and whether the default OpenClaw migration source exists.
 
 ---
 
@@ -353,6 +390,11 @@ BearClaw enforces a layered security model:
 ### Shell Command Blocklist
 
 The `shell` tool blocks a set of destructive command patterns before execution (e.g. `rm -rf`, `mkfs`, `dd if=`, `:(){ :|:& };:`). This is a defense-in-depth layer — it is not a sandbox. Full sandboxing requires OS-level isolation.
+
+Time-bounded tool execution is enforced by default. `shell`,
+`git_operations`, cron shell wrappers, and `http_request` all return an
+explicit timeout error after 30 seconds instead of hanging the agent
+indefinitely.
 
 ### Audit Log
 
@@ -410,7 +452,11 @@ Starts an internal HTTP server on `127.0.0.1:8080`:
 | `/webhook` | POST | `{"received":true}` |
 | `/v1/chat` | POST | `{"message":{...},"requires_confirmation":false,"confirmation_reason":null}` |
 
-`/v1/chat` is designed for trusted local callers (for example, Tardigrade edge running on the same host). It does not enforce bearer auth directly in this MVP.
+`/v1/chat` is designed for trusted local callers (for example, Tardigrade edge
+running on the same host). It does not enforce bearer auth directly in this
+MVP. Each connection is handled on its own thread, and agent execution is cut
+off after 30 seconds with `504 Gateway Timeout` instead of blocking the gateway
+indefinitely.
 
 ### Daemon
 
@@ -476,7 +522,7 @@ bareclaw/
 │   ├── cron.zig          # Task scheduler with TSV persistence
 │   ├── gateway.zig       # Minimal TCP/HTTP server
 │   ├── daemon.zig        # Gateway + cron combined runner
-│   ├── peripherals.zig   # Hardware peripheral listing (stub)
+│   ├── peripherals.zig   # Hardware peripheral config parsing and listing
 │   └── migration.zig     # OpenClaw workspace importer
 └── build.zig             # Zig build system
 ```

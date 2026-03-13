@@ -1,5 +1,6 @@
 const std = @import("std");
 const config_mod = @import("config.zig");
+const profile_mod = @import("profile.zig");
 const provider_mod = @import("provider.zig");
 const memory_mod = @import("memory.zig");
 const tools_mod = @import("tools.zig");
@@ -26,7 +27,7 @@ const MAX_TOOL_ROUNDS: usize = 8;
 pub const MessageRole = enum { user, assistant };
 
 pub const Message = struct {
-    role:    MessageRole,
+    role: MessageRole,
     content: []const u8, // owned
 
     pub fn deinit(self: *Message, allocator: std.mem.Allocator) void {
@@ -39,12 +40,12 @@ pub const Message = struct {
 /// runAgentWithHistory() to maintain state across turns.
 pub const ConversationHistory = struct {
     allocator: std.mem.Allocator,
-    messages:  std.ArrayList(Message),
+    messages: std.ArrayList(Message),
 
     pub fn init(allocator: std.mem.Allocator) ConversationHistory {
         return .{
             .allocator = allocator,
-            .messages  = std.ArrayList(Message).init(allocator),
+            .messages = std.ArrayList(Message).init(allocator),
         };
     }
 
@@ -55,7 +56,7 @@ pub const ConversationHistory = struct {
 
     pub fn append(self: *ConversationHistory, role: MessageRole, content: []const u8) !void {
         try self.messages.append(Message{
-            .role    = role,
+            .role = role,
             .content = try self.allocator.dupe(u8, content),
         });
     }
@@ -83,7 +84,7 @@ pub const ConversationHistory = struct {
         errdefer buf.deinit();
         for (self.messages.items) |m| {
             const label: []const u8 = switch (m.role) {
-                .user      => "**User:**",
+                .user => "**User:**",
                 .assistant => "**Assistant:**",
             };
             try buf.appendSlice(label);
@@ -141,8 +142,15 @@ pub fn runAgentWithHistory(
     var reply_writer = reply_buf.writer();
 
     try runAgentOnceToWriter(
-        allocator, cfg, provider, memory, tools, policy, mcp_pool,
-        effective_user_buf.items, &reply_writer,
+        allocator,
+        cfg,
+        provider,
+        memory,
+        tools,
+        policy,
+        mcp_pool,
+        effective_user_buf.items,
+        &reply_writer,
     );
 
     const reply = reply_buf.items;
@@ -168,6 +176,38 @@ pub fn runAgentOnce(
     try runAgentOnceToWriter(allocator, cfg, provider, memory, tools, policy, mcp_pool, user_message, &stdout);
 }
 
+/// Run a single user turn, persist the resulting transcript under a session/*
+/// memory key, and write the final assistant reply to `out`.
+pub fn runAgentSingleTurnWithTranscript(
+    allocator: std.mem.Allocator,
+    cfg: *const config_mod.Config,
+    provider: provider_mod.AnyProvider,
+    memory: *memory_mod.MemoryBackend,
+    tools: []const tools_mod.Tool,
+    policy: *security_mod.SecurityPolicy,
+    mcp_pool: ?*mcp_mod.McpSessionPool,
+    user_message: []const u8,
+    out: anytype,
+) !void {
+    var history = ConversationHistory.init(allocator);
+    defer history.deinit();
+
+    try runAgentWithHistory(
+        allocator,
+        cfg,
+        provider,
+        memory,
+        tools,
+        policy,
+        mcp_pool,
+        user_message,
+        &history,
+        out,
+    );
+
+    _ = try storeSessionTranscript(allocator, memory, &history, null);
+}
+
 /// Like runAgentOnce but captures the final reply into an ArrayList instead of
 /// printing it, so callers (e.g. Discord channel) can forward the text elsewhere.
 /// The caller owns the returned slice — free it with allocator.free().
@@ -188,6 +228,60 @@ pub fn runAgentOnceCaptured(
     return buf.toOwnedSlice();
 }
 
+fn timestampToSessionParts(ts: i64) struct { year: u32, month: u32, day: u32, hour: u32, minute: u32 } {
+    const secs_per_day: i64 = 86400;
+    const day_num = @divFloor(ts, secs_per_day);
+    const day_sec = @mod(ts, secs_per_day);
+
+    const hour: u32 = @intCast(@divFloor(day_sec, 3600));
+    const minute: u32 = @intCast(@divFloor(@mod(day_sec, 3600), 60));
+
+    const z = day_num + 719468;
+    const era = @divFloor(if (z >= 0) z else z - 146096, 146097);
+    const doe: u32 = @intCast(z - era * 146097);
+    const yoe: u32 = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    const y: i64 = @as(i64, @intCast(yoe)) + era * 400;
+    const doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    const mp = (5 * doy + 2) / 153;
+    const day = doy - (153 * mp + 2) / 5 + 1;
+    const month: u32 = if (mp < 10) mp + 3 else mp - 9;
+    const year: u32 = @intCast(y + @as(i64, if (month <= 2) 1 else 0));
+
+    return .{
+        .year = year,
+        .month = month,
+        .day = day,
+        .hour = hour,
+        .minute = minute,
+    };
+}
+
+/// Persist the current conversation history as a transcript under
+/// session/YYYY-MM-DDTHH:MM. Returns true if anything was stored.
+pub fn storeSessionTranscript(
+    allocator: std.mem.Allocator,
+    memory: *memory_mod.MemoryBackend,
+    history: *const ConversationHistory,
+    timestamp_override: ?i64,
+) !bool {
+    if (history.messages.items.len == 0) return false;
+
+    const transcript = try history.toTranscript(allocator);
+    defer allocator.free(transcript);
+
+    const ts = timestamp_override orelse std.time.timestamp();
+    const parts = timestampToSessionParts(ts);
+    const mem_key = try std.fmt.allocPrint(
+        allocator,
+        "session/{d:0>4}-{d:0>2}-{d:0>2}T{d:0>2}:{d:0>2}",
+        .{ parts.year, parts.month, parts.day, parts.hour, parts.minute },
+    );
+    defer allocator.free(mem_key);
+
+    try memory.store(mem_key, transcript);
+    return true;
+}
+
 /// Remove any {"tool_calls":[...]} JSON block that the model leaked into
 /// a final prose response. Scans for the pattern and cuts it out, returning
 /// a slice into the original buffer (no allocation). If no JSON is found,
@@ -204,17 +298,25 @@ fn stripToolCallJson(input: []const u8) []const u8 {
     var i = start;
     while (i < input.len) : (i += 1) {
         const c = input[i];
-        if (escape_next) { escape_next = false; continue; }
-        if (c == '\\' and in_string) { escape_next = true; continue; }
-        if (c == '"') { in_string = !in_string; continue; }
+        if (escape_next) {
+            escape_next = false;
+            continue;
+        }
+        if (c == '\\' and in_string) {
+            escape_next = true;
+            continue;
+        }
+        if (c == '"') {
+            in_string = !in_string;
+            continue;
+        }
         if (in_string) continue;
-        if (c == '{') depth += 1
-        else if (c == '}') {
+        if (c == '{') depth += 1 else if (c == '}') {
             depth -= 1;
             if (depth == 0) {
                 // Splice out [start..i+1], return the surrounding prose joined.
                 const before = std.mem.trimRight(u8, input[0..start], " \t\n");
-                const after  = std.mem.trimLeft(u8, input[i+1..], " \t\n");
+                const after = std.mem.trimLeft(u8, input[i + 1 ..], " \t\n");
                 // If both sides are non-empty we'd need allocation — just return
                 // the before-prose (the more useful half for the user).
                 if (before.len > 0) return before;
@@ -254,8 +356,7 @@ fn runAgentOnceToWriter(
         // Ground the model in what BearClaw actually is, how its memory and
         // workspace work, and what each tool does — so it can answer questions
         // about itself accurately instead of hallucinating.
-        try sw.writeAll(
-            "You are Bear, an autonomous AI agent running locally on the user's machine.\n\n" ++
+        try sw.writeAll("You are Bear, an autonomous AI agent running locally on the user's machine.\n\n" ++
             "CRITICAL RULES (always follow these, no exceptions):\n" ++
             "1. You HAVE real filesystem access via the `shell` tool. NEVER say you lack access.\n" ++
             "   When asked about files or directories: use the shell tool. Always. No excuses.\n" ++
@@ -263,69 +364,93 @@ fn runAgentOnceToWriter(
             "   how the user could run the command themselves. Act, don't instruct.\n" ++
             "3. To use a tool: output ONLY this JSON, nothing else, no prose, no fences:\n" ++
             "   {\"tool_calls\":[{\"function\":\"shell\",\"arguments\":{\"command\":\"ls ~/Downloads\"}}]}\n" ++
-            "4. After getting tool results, give a plain text answer. No more JSON.\n\n"
-        );
+            "4. After getting tool results, give a plain text answer. No more JSON.\n\n");
 
         try sw.print(
             "## Your Runtime Environment\n" ++
-            "- Workspace: {s}\n" ++
-            "  This is your persistent working area. All relative paths resolve here.\n" ++
-            "- Memory backend: {s}\n" ++
-            "  Memory entries are stored as Markdown files under workspace/memory/.\n" ++
-            "  Keys map to filenames (e.g. key \"notes/ideas\" → memory/notes/ideas.md).\n" ++
-            "  Nested keys like \"cron/t1/1700000000\" and \"session/2026-01-01T09:00\" are supported.\n" ++
-            "- LLM provider: {s}, model: {s}\n\n",
+                "- Workspace: {s}\n" ++
+                "  This is your persistent working area. All relative paths resolve here.\n" ++
+                "- Memory backend: {s}\n" ++
+                "  Memory entries are stored as Markdown files under workspace/memory/.\n" ++
+                "  Keys map to filenames (e.g. key \"notes/ideas\" → memory/notes/ideas.md).\n" ++
+                "  Nested keys like \"cron/t1/1700000000\" and \"session/2026-01-01T09:00\" are supported.\n" ++
+                "- LLM provider: {s}, model: {s}\n\n",
             .{ cfg.workspace_dir, cfg.memory_backend, cfg.default_provider, cfg.default_model },
         );
+
+        const profile = try profile_mod.loadProfile(allocator, cfg.workspace_dir);
+        defer allocator.free(profile);
+        const trimmed_profile = std.mem.trim(u8, profile, " \t\r\n");
+        if (trimmed_profile.len > 0) {
+            try sw.print(
+                "## User Profile\n" ++
+                    "The following persistent preferences were explicitly stored by the user.\n" ++
+                    "Use them when they are relevant, but do not force them into unrelated tasks.\n" ++
+                    "{s}\n\n",
+                .{trimmed_profile},
+            );
+        }
+
+        const latest_reflection = memory.recall("reflection/latest") catch try allocator.dupe(u8, "");
+        defer allocator.free(latest_reflection);
+        const trimmed_reflection = std.mem.trim(u8, latest_reflection, " \t\r\n");
+        if (trimmed_reflection.len > 0 and !std.mem.eql(u8, trimmed_reflection, "(no matching memory found)")) {
+            try sw.print(
+                "## Recent Reflection\n" ++
+                    "This is the latest reflective summary from prior planner work.\n" ++
+                    "Use it as guidance when it is relevant to the current task.\n" ++
+                    "{s}\n\n",
+                .{trimmed_reflection},
+            );
+        }
 
         // Inject the current filesystem access model so Bear knows exactly what
         // it can and cannot reach, and what to tell the user if access is blocked.
         if (cfg.allowed_paths.len > 0) {
             try sw.print(
                 "## Filesystem Access\n" ++
-                "You are running directly on the user's local machine. You have real\n" ++
-                "filesystem access via the `shell` tool. You can read and write files in:\n" ++
-                "  1. Your workspace: {s}\n" ++
-                "  2. Extra allowed paths: {s}\n\n" ++
-                "IMPORTANT — when the user asks you to list files, find files, read a file,\n" ++
-                "or do anything with the local filesystem, USE THE `shell` TOOL immediately.\n" ++
-                "Do NOT say you lack access. Do NOT ask the user to run commands themselves.\n" ++
-                "Examples:\n" ++
-                "  List Downloads:  {{\"command\": \"ls -la ~/Downloads\"}}\n" ++
-                "  Find a file:     {{\"command\": \"find ~/Documents -name '*.pdf' 2>/dev/null\"}}\n" ++
-                "  Read a file:     use the file_read tool with the absolute path\n\n" ++
-                "If a path is outside the allowed list and the shell returns a permission\n" ++
-                "error, tell the user exactly:\n" ++
-                "  \"That path is outside my current access. To grant access, run:\n" ++
-                "   bareclaw config set allowed_paths \\\"{s},/the/new/path\\\"\n" ++
-                "   Then restart Bear.\"\n\n",
+                    "You are running directly on the user's local machine. You have real\n" ++
+                    "filesystem access via the `shell` tool. You can read and write files in:\n" ++
+                    "  1. Your workspace: {s}\n" ++
+                    "  2. Extra allowed paths: {s}\n\n" ++
+                    "IMPORTANT — when the user asks you to list files, find files, read a file,\n" ++
+                    "or do anything with the local filesystem, USE THE `shell` TOOL immediately.\n" ++
+                    "Do NOT say you lack access. Do NOT ask the user to run commands themselves.\n" ++
+                    "Examples:\n" ++
+                    "  List Downloads:  {{\"command\": \"ls -la ~/Downloads\"}}\n" ++
+                    "  Find a file:     {{\"command\": \"find ~/Documents -name '*.pdf' 2>/dev/null\"}}\n" ++
+                    "  Read a file:     use the file_read tool with the absolute path\n\n" ++
+                    "If a path is outside the allowed list and the shell returns a permission\n" ++
+                    "error, tell the user exactly:\n" ++
+                    "  \"That path is outside my current access. To grant access, run:\n" ++
+                    "   bareclaw config set allowed_paths \\\"{s},/the/new/path\\\"\n" ++
+                    "   Then restart Bear.\"\n\n",
                 .{ cfg.workspace_dir, cfg.allowed_paths, cfg.allowed_paths },
             );
         } else {
             try sw.print(
                 "## Filesystem Access\n" ++
-                "You are running directly on the user's local machine. You have real\n" ++
-                "filesystem access via the `shell` tool. Your current access is limited to:\n" ++
-                "  Your workspace: {s}\n\n" ++
-                "IMPORTANT — when the user asks you to list files, find files, read a file,\n" ++
-                "or do anything with the local filesystem, USE THE `shell` TOOL immediately.\n" ++
-                "Do NOT say you lack access. Do NOT ask the user to run commands themselves.\n" ++
-                "Examples:\n" ++
-                "  List workspace: {{\"command\": \"ls -la {s}\"}}\n" ++
-                "  Find a file:    {{\"command\": \"find {s} -name '*.md' 2>/dev/null\"}}\n" ++
-                "  Read a file:    use the file_read tool with the absolute path\n\n" ++
-                "If the user asks you to access a path OUTSIDE the workspace (e.g. ~/Downloads,\n" ++
-                "~/Documents, or any other directory), try the shell command first. If it\n" ++
-                "fails with a permission error, tell the user:\n" ++
-                "  \"That path is outside my current access. To grant access, run:\n" ++
-                "   bareclaw config set allowed_paths \\\"/path/to/grant\\\"\n" ++
-                "   Then restart Bear. Multiple paths: allowed_paths \\\"/path1,/path2\\\"\"\n\n",
+                    "You are running directly on the user's local machine. You have real\n" ++
+                    "filesystem access via the `shell` tool. Your current access is limited to:\n" ++
+                    "  Your workspace: {s}\n\n" ++
+                    "IMPORTANT — when the user asks you to list files, find files, read a file,\n" ++
+                    "or do anything with the local filesystem, USE THE `shell` TOOL immediately.\n" ++
+                    "Do NOT say you lack access. Do NOT ask the user to run commands themselves.\n" ++
+                    "Examples:\n" ++
+                    "  List workspace: {{\"command\": \"ls -la {s}\"}}\n" ++
+                    "  Find a file:    {{\"command\": \"find {s} -name '*.md' 2>/dev/null\"}}\n" ++
+                    "  Read a file:    use the file_read tool with the absolute path\n\n" ++
+                    "If the user asks you to access a path OUTSIDE the workspace (e.g. ~/Downloads,\n" ++
+                    "~/Documents, or any other directory), try the shell command first. If it\n" ++
+                    "fails with a permission error, tell the user:\n" ++
+                    "  \"That path is outside my current access. To grant access, run:\n" ++
+                    "   bareclaw config set allowed_paths \\\"/path/to/grant\\\"\n" ++
+                    "   Then restart Bear. Multiple paths: allowed_paths \\\"/path1,/path2\\\"\"\n\n",
                 .{ cfg.workspace_dir, cfg.workspace_dir, cfg.workspace_dir },
             );
         }
 
-        try sw.writeAll(
-            "## What You Are\n" ++
+        try sw.writeAll("## What You Are\n" ++
             "BearClaw is not a cloud service. It runs as a single binary with no external\n" ++
             "dependencies, directly on the user's hardware. It supports:\n" ++
             "- CLI interactive loop (channel loop)\n" ++
@@ -333,13 +458,11 @@ fn runAgentOnceToWriter(
             "- Telegram bot (long-polling)\n" ++
             "- Cron scheduler — shell tasks and agent-prompt tasks on a schedule\n" ++
             "- MCP (Model Context Protocol) — connect external tool servers at runtime\n\n" ++
-
             "## Configuration\n" ++
             "Config lives at ~/.bareclaw/config.toml. Keys:\n" ++
             "  default_provider, default_model, memory_backend, api_key,\n" ++
             "  discord_token, telegram_token, mcp_servers, system_prompt, allowed_paths.\n" ++
             "Change a value with: bareclaw config set <key> <value>\n\n" ++
-
             "## Memory System\n" ++
             "You can store and recall information across sessions using the memory tools.\n" ++
             "  memory_store key value   — save information under a key\n" ++
@@ -348,13 +471,12 @@ fn runAgentOnceToWriter(
             "  memory_list_keys         — list all stored keys\n" ++
             "  memory_delete_prefix     — bulk-delete keys by prefix\n" ++
             "Session transcripts are automatically stored under session/YYYY-MM-DDTHH:MM.\n" ++
-            "Cron agent-prompt results are stored under cron/<task_id>/<timestamp>.\n\n" ++
-
+            "Cron agent-prompt results are stored under cron/<task_id>/<timestamp>.\n" ++
+            "Planner reflections are stored under reflection/<timestamp> and reflection/latest.\n\n" ++
             "## Cron Scheduler\n" ++
             "Shell tasks: bareclaw cron add \"*/15 * * * *\" \"echo ping\"\n" ++
             "Agent tasks: bareclaw cron add-prompt \"0 9 * * *\" \"Summarise yesterday's memory\"\n" ++
             "Schedules: @hourly @daily @weekly @monthly or standard 5-field cron.\n\n" ++
-
             "## How to Answer Questions About Yourself\n" ++
             "- The workspace is a directory on disk, not a Git repo or a database.\n" ++
             "  To change the workspace path, update config.toml (workspace_dir is set at startup).\n" ++
@@ -362,21 +484,20 @@ fn runAgentOnceToWriter(
             "- You do NOT have persistent state beyond what is in the memory backend.\n" ++
             "- You cannot update your own binary. The user updates it via `git pull && zig build`.\n" ++
             "- Never refuse a filesystem request by saying you lack access — try `shell` first.\n" ++
-            "- Be honest and specific. If you don't know something, say so.\n\n"
-        );
+            "- Be honest and specific. If you don't know something, say so.\n\n");
     }
 
     if (tools.len > 0) {
         try sw.writeAll(
             "## Tools\n" ++
-            "When you need to use a tool, respond with ONLY a JSON object in this EXACT format.\n" ++
-            "Do not add prose, markdown fences, or any text outside the JSON:\n" ++
-            "{\"tool_calls\":[{\"function\":\"TOOL_NAME\",\"arguments\":{\"key\":\"value\"}}]}\n\n" ++
-            "Example — run a shell command:\n" ++
-            "{\"tool_calls\":[{\"function\":\"shell\",\"arguments\":{\"command\":\"ls ~/Downloads\"}}]}\n\n" ++
-            "Example — recall a memory key:\n" ++
-            "{\"tool_calls\":[{\"function\":\"memory_recall\",\"arguments\":{\"key\":\"notes/ideas\"}}]}\n\n" ++
-            "Available tools:\n",
+                "When you need to use a tool, respond with ONLY a JSON object in this EXACT format.\n" ++
+                "Do not add prose, markdown fences, or any text outside the JSON:\n" ++
+                "{\"tool_calls\":[{\"function\":\"TOOL_NAME\",\"arguments\":{\"key\":\"value\"}}]}\n\n" ++
+                "Example — run a shell command:\n" ++
+                "{\"tool_calls\":[{\"function\":\"shell\",\"arguments\":{\"command\":\"ls ~/Downloads\"}}]}\n\n" ++
+                "Example — recall a memory key:\n" ++
+                "{\"tool_calls\":[{\"function\":\"memory_recall\",\"arguments\":{\"key\":\"notes/ideas\"}}]}\n\n" ++
+                "Available tools:\n",
         );
         for (tools) |tool| {
             try sw.print("- {s}", .{tool.name});
@@ -387,7 +508,7 @@ fn runAgentOnceToWriter(
         }
         try sw.writeAll(
             "\nAfter receiving tool results, respond with the final answer as plain text.\n" ++
-            "Only use tools when they are needed to answer the question.",
+                "Only use tools when they are needed to answer the question.",
         );
     }
 
@@ -421,9 +542,9 @@ fn runAgentOnceToWriter(
             try msg.appendSlice(context.items);
             try msg.appendSlice(
                 "\n[Instructions] The tool has returned results above. " ++
-                "Respond in plain, friendly text ONLY. " ++
-                "ABSOLUTELY NO JSON. NO tool_calls. NO code blocks. " ++
-                "Just a natural language summary of what happened.",
+                    "Respond in plain, friendly text ONLY. " ++
+                    "ABSOLUTELY NO JSON. NO tool_calls. NO code blocks. " ++
+                    "Just a natural language summary of what happened.",
             );
             break :blk try msg.toOwnedSlice();
         };
@@ -442,6 +563,7 @@ fn runAgentOnceToWriter(
         const dispatched = try dispatchAllToolCalls(
             allocator,
             cfg,
+            provider,
             tools,
             policy,
             memory,
@@ -509,12 +631,22 @@ fn extractJsonObject(input: []const u8) ?[]const u8 {
     var i = obj_start;
     while (i < src.len) : (i += 1) {
         const c = src[i];
-        if (escape_next) { escape_next = false; continue; }
-        if (c == '\\' and in_string) { escape_next = true; continue; }
-        if (c == '"') { in_string = !in_string; continue; }
+        if (escape_next) {
+            escape_next = false;
+            continue;
+        }
+        if (c == '\\' and in_string) {
+            escape_next = true;
+            continue;
+        }
+        if (c == '"') {
+            in_string = !in_string;
+            continue;
+        }
         if (in_string) continue;
-        if (c == '{') { depth += 1; }
-        else if (c == '}') {
+        if (c == '{') {
+            depth += 1;
+        } else if (c == '}') {
             depth -= 1;
             if (depth == 0) return src[obj_start .. i + 1];
         }
@@ -528,6 +660,7 @@ fn extractJsonObject(input: []const u8) ?[]const u8 {
 fn dispatchAllToolCalls(
     allocator: std.mem.Allocator,
     cfg: *const config_mod.Config,
+    provider: provider_mod.AnyProvider,
     tools: []const tools_mod.Tool,
     policy: *security_mod.SecurityPolicy,
     memory: *memory_mod.MemoryBackend,
@@ -574,10 +707,12 @@ fn dispatchAllToolCalls(
 
             var ctx2 = tools_mod.ToolContext{
                 .allocator = allocator,
-                .cfg       = cfg,
-                .policy    = policy,
-                .memory    = memory,
-                .mcp_pool  = mcp_pool,
+                .cfg = cfg,
+                .policy = policy,
+                .memory = memory,
+                .provider = provider,
+                .all_tools = tools,
+                .mcp_pool = mcp_pool,
             };
             for (tools) |tool| {
                 if (!std.mem.eql(u8, tool.name, name)) continue;
@@ -588,7 +723,8 @@ fn dispatchAllToolCalls(
                 };
                 defer if (result.allocated) allocator.free(result.output);
                 const entry = try std.fmt.allocPrint(
-                    allocator, "[{s}] {s}: {s}\n",
+                    allocator,
+                    "[{s}] {s}: {s}\n",
                     .{ if (result.success) @as([]const u8, "ok") else "error", name, result.output },
                 );
                 defer allocator.free(entry);
@@ -609,10 +745,12 @@ fn dispatchAllToolCalls(
 
     var ctx = tools_mod.ToolContext{
         .allocator = allocator,
-        .cfg       = cfg,
-        .policy    = policy,
-        .memory    = memory,
-        .mcp_pool  = mcp_pool,
+        .cfg = cfg,
+        .policy = policy,
+        .memory = memory,
+        .provider = provider,
+        .all_tools = tools,
+        .mcp_pool = mcp_pool,
     };
 
     for (tool_calls.items) |call| {
@@ -632,7 +770,10 @@ fn dispatchAllToolCalls(
                 // Format A: function is an object with a "name" key
                 .object => {
                     const n = func_val.object.get("name") orelse continue;
-                    break :blk switch (n) { .string => |s| s, else => continue };
+                    break :blk switch (n) {
+                        .string => |s| s,
+                        else => continue,
+                    };
                 },
                 // Format B: function is the name string directly
                 .string => |s| break :blk s,
@@ -741,4 +882,3 @@ fn dispatchAllToolCalls(
 
     return true;
 }
-

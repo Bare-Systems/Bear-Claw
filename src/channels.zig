@@ -7,14 +7,13 @@
 ///
 /// Each channel receives messages from the platform and routes them through
 /// the agent, then sends the reply back.
-
 const std = @import("std");
-const agent_mod    = @import("agent.zig");
-const config_mod   = @import("config.zig");
+const agent_mod = @import("agent.zig");
+const config_mod = @import("config.zig");
 const provider_mod = @import("provider.zig");
-const memory_mod   = @import("memory.zig");
-const mcp_mod      = @import("mcp_client.zig");
-const tools_mod    = @import("tools.zig");
+const memory_mod = @import("memory.zig");
+const mcp_mod = @import("mcp_client.zig");
+const tools_mod = @import("tools.zig");
 const security_mod = @import("security.zig");
 
 pub const ChannelMessage = struct {
@@ -24,9 +23,9 @@ pub const ChannelMessage = struct {
 // ── shared helper: build the full agent stack ─────────────────────────────────
 
 const AgentStack = struct {
-    provider:      provider_mod.Provider,
-    mem_backend:   memory_mod.MemoryBackend,
-    policy:        security_mod.SecurityPolicy,
+    provider: provider_mod.Provider,
+    mem_backend: memory_mod.MemoryBackend,
+    policy: security_mod.SecurityPolicy,
     tool_registry: []tools_mod.Tool,
     // NOTE: any_provider is NOT stored here — its internal pointer becomes
     // dangling if AgentStack is returned by value and moved. Callers must
@@ -43,9 +42,9 @@ const AgentStack = struct {
 
 fn buildStack(allocator: std.mem.Allocator, cfg: *const config_mod.Config) !AgentStack {
     var stack: AgentStack = undefined;
-    stack.provider      = try provider_mod.createDefaultProvider(allocator, cfg);
-    stack.mem_backend   = try memory_mod.createMemoryBackend(allocator, cfg);
-    stack.policy        = security_mod.SecurityPolicy.initWorkspaceOnly(allocator, cfg);
+    stack.provider = try provider_mod.createDefaultProvider(allocator, cfg);
+    stack.mem_backend = try memory_mod.createMemoryBackend(allocator, cfg);
+    stack.policy = security_mod.SecurityPolicy.initWorkspaceOnly(allocator, cfg);
     stack.tool_registry = try tools_mod.buildCoreTools(allocator, &stack.policy, &stack.mem_backend);
     return stack;
 }
@@ -58,7 +57,7 @@ pub fn runCliChannelOnce(cfg: *const config_mod.Config) !void {
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    const stdin  = std.io.getStdIn().reader();
+    const stdin = std.io.getStdIn().reader();
     const stdout = std.io.getStdOut().writer();
 
     try stdout.print("BearClaw CLI channel – type a message and press Enter.\n> ", .{});
@@ -70,9 +69,16 @@ pub fn runCliChannelOnce(cfg: *const config_mod.Config) !void {
     defer stack.deinit(allocator);
     const any_provider = provider_mod.AnyProvider.fromProvider(&stack.provider);
 
-    try agent_mod.runAgentOnce(
-        allocator, cfg, any_provider,
-        &stack.mem_backend, stack.tool_registry, &stack.policy, null, line,
+    try agent_mod.runAgentSingleTurnWithTranscript(
+        allocator,
+        cfg,
+        any_provider,
+        &stack.mem_backend,
+        stack.tool_registry,
+        &stack.policy,
+        null,
+        line,
+        &stdout,
     );
 }
 
@@ -82,7 +88,7 @@ pub fn runCliChannelLoop(cfg: *const config_mod.Config) !void {
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    const stdin  = std.io.getStdIn().reader();
+    const stdin = std.io.getStdIn().reader();
     const stdout = std.io.getStdOut().writer();
 
     var stack = try buildStack(allocator, cfg);
@@ -140,8 +146,12 @@ pub fn runCliChannelLoop(cfg: *const config_mod.Config) !void {
 
         // T2-1: Use history-aware agent call so each turn sees prior context.
         agent_mod.runAgentWithHistory(
-            allocator, cfg, any_provider,
-            &stack.mem_backend, all_tools.items, &stack.policy,
+            allocator,
+            cfg,
+            any_provider,
+            &stack.mem_backend,
+            all_tools.items,
+            &stack.policy,
             if (has_mcp) &mcp_pool else null,
             trimmed,
             &history,
@@ -152,27 +162,12 @@ pub fn runCliChannelLoop(cfg: *const config_mod.Config) !void {
     }
 
     // T2-2: Store session transcript in memory when the session ends.
-    // Only bother if there were actual messages exchanged.
-    if (history.messages.items.len > 0) {
-        const transcript = history.toTranscript(allocator) catch null;
-        if (transcript) |t| {
-            defer allocator.free(t);
-            const ts = std.time.timestamp();
-            const bt = @import("cron.zig").timestampToBroken(ts);
-            const mem_key = std.fmt.allocPrint(
-                allocator,
-                "session/{d:0>4}-{d:0>2}-{d:0>2}T{d:0>2}:{d:0>2}",
-                .{ bt.year, bt.month, bt.day, bt.hour, bt.minute },
-            ) catch null;
-            if (mem_key) |k| {
-                defer allocator.free(k);
-                stack.mem_backend.store(k, t) catch |err| {
-                    // Non-fatal — don't propagate storage errors to the user.
-                    std.debug.print("session transcript store failed: {}\n", .{err});
-                };
-            }
-        }
-    }
+    const stored = agent_mod.storeSessionTranscript(allocator, &stack.mem_backend, &history, null) catch |err| blk: {
+        // Non-fatal — don't propagate storage errors to the user.
+        std.debug.print("session transcript store failed: {}\n", .{err});
+        break :blk false;
+    };
+    _ = stored;
 }
 
 // ── Discord channel ───────────────────────────────────────────────────────────
@@ -210,12 +205,12 @@ pub fn runDiscordChannel(cfg: *const config_mod.Config, debug: bool) !void {
 
     // Resolve bot token.
     const token = std.process.getEnvVarOwned(allocator, "DISCORD_BOT_TOKEN") catch
-                  (if (cfg.discord_token.len > 0)
-                      try allocator.dupe(u8, cfg.discord_token)
-                  else {
-                      try stdout.print("Discord: no bot token (set DISCORD_BOT_TOKEN or discord_token in config)\n", .{});
-                      return;
-                  });
+        (if (cfg.discord_token.len > 0)
+            try allocator.dupe(u8, cfg.discord_token)
+        else {
+            try stdout.print("Discord: no bot token (set DISCORD_BOT_TOKEN or discord_token in config)\n", .{});
+            return;
+        });
     defer allocator.free(token);
 
     var stack = try buildStack(allocator, cfg);
@@ -264,14 +259,19 @@ pub fn runDiscordChannel(cfg: *const config_mod.Config, debug: bool) !void {
     var attempt: u32 = 0;
     while (true) {
         discordGatewayLoop(
-            allocator, cfg, token, any_provider,
-            &stack.mem_backend, &stack.policy,
-            all_tools.items, if (has_mcp) &mcp_pool else null,
-            stdout, debug,
+            allocator,
+            cfg,
+            token,
+            any_provider,
+            &stack.mem_backend,
+            &stack.policy,
+            all_tools.items,
+            if (has_mcp) &mcp_pool else null,
+            stdout,
+            debug,
         ) catch |err| {
             const delay_s: u64 = @min(30, @as(u64, attempt) * 5 + 5);
-            try stdout.print("Discord gateway error: {} — reconnecting in {d}s...\n",
-                .{ err, delay_s });
+            try stdout.print("Discord gateway error: {} — reconnecting in {d}s...\n", .{ err, delay_s });
             std.time.sleep(delay_s * std.time.ns_per_s);
         };
         attempt += 1;
@@ -334,11 +334,11 @@ fn discordGatewayLoop(
     const upgrade_req = try std.fmt.allocPrint(
         allocator,
         "GET /?v=10&encoding=json HTTP/1.1\r\n" ++
-        "Host: {s}\r\n" ++
-        "Upgrade: websocket\r\n" ++
-        "Connection: Upgrade\r\n" ++
-        "Sec-WebSocket-Key: {s}\r\n" ++
-        "Sec-WebSocket-Version: 13\r\n\r\n",
+            "Host: {s}\r\n" ++
+            "Upgrade: websocket\r\n" ++
+            "Connection: Upgrade\r\n" ++
+            "Sec-WebSocket-Key: {s}\r\n" ++
+            "Sec-WebSocket-Version: 13\r\n\r\n",
         .{ host, key_b64 },
     );
     defer allocator.free(upgrade_req);
@@ -383,10 +383,11 @@ fn discordGatewayLoop(
     //   4096  = DIRECT_MESSAGES   (DMs to the bot)
     //   32768 = MESSAGE_CONTENT   (privileged — enabled in Discord Dev Portal)
     // Total: 37376
-    const identify = try std.fmt.allocPrint(allocator,
+    const identify = try std.fmt.allocPrint(
+        allocator,
         "{{\"op\":2,\"d\":{{\"token\":\"{s}\"," ++
-        "\"intents\":37376," ++
-        "\"properties\":{{\"os\":\"linux\",\"browser\":\"bareclaw\",\"device\":\"bareclaw\"}}}}}}",
+            "\"intents\":37376," ++
+            "\"properties\":{{\"os\":\"linux\",\"browser\":\"bareclaw\",\"device\":\"bareclaw\"}}}}}}",
         .{token},
     );
     defer allocator.free(identify);
@@ -421,8 +422,7 @@ fn discordGatewayLoop(
     while (true) {
         const now = std.time.milliTimestamp();
         if (now - last_heartbeat >= @as(i64, @intCast(heartbeat_interval_ms))) {
-            if (debug) try stdout.print("[DEBUG] Sending heartbeat (seq={d}, interval={d}ms)...\n",
-                .{ sequence, heartbeat_interval_ms });
+            if (debug) try stdout.print("[DEBUG] Sending heartbeat (seq={d}, interval={d}ms)...\n", .{ sequence, heartbeat_interval_ms });
             const hb = try std.fmt.allocPrint(allocator, "{{\"op\":1,\"d\":{d}}}", .{sequence});
             defer allocator.free(hb);
             try tlsWsSendText(&tls, tcp, allocator, hb);
@@ -441,8 +441,7 @@ fn discordGatewayLoop(
         if (payload.len == 0) continue;
         defer allocator.free(payload);
 
-        if (debug) try stdout.print("[DEBUG] Frame received ({d} bytes): {s}\n",
-            .{ payload.len, if (payload.len > 200) payload[0..200] else payload });
+        if (debug) try stdout.print("[DEBUG] Frame received ({d} bytes): {s}\n", .{ payload.len, if (payload.len > 200) payload[0..200] else payload });
 
         const parsed = std.json.parseFromSlice(std.json.Value, allocator, payload, .{}) catch {
             if (debug) try stdout.print("[DEBUG] Failed to parse frame as JSON, skipping.\n", .{});
@@ -451,7 +450,10 @@ fn discordGatewayLoop(
         defer parsed.deinit();
 
         const op_val = parsed.value.object.get("op") orelse continue;
-        const op: i64 = switch (op_val) { .integer => |i| i, else => continue };
+        const op: i64 = switch (op_val) {
+            .integer => |i| i,
+            else => continue,
+        };
 
         if (debug) try stdout.print("[DEBUG] Gateway op={d}\n", .{op});
 
@@ -465,12 +467,14 @@ fn discordGatewayLoop(
                 if (d.object.get("heartbeat_interval")) |hbi| {
                     if (hbi == .integer) heartbeat_interval_ms = @intCast(hbi.integer);
                 }
-                if (debug) try stdout.print("[DEBUG] Hello received, heartbeat_interval={d}ms\n",
-                    .{heartbeat_interval_ms});
+                if (debug) try stdout.print("[DEBUG] Hello received, heartbeat_interval={d}ms\n", .{heartbeat_interval_ms});
             },
             0 => {
                 const t_val = parsed.value.object.get("t") orelse continue;
-                const event_type = switch (t_val) { .string => |s| s, else => continue };
+                const event_type = switch (t_val) {
+                    .string => |s| s,
+                    else => continue,
+                };
                 if (debug) try stdout.print("[DEBUG] Dispatch event: {s}\n", .{event_type});
 
                 if (std.mem.eql(u8, event_type, "READY")) {
@@ -484,8 +488,12 @@ fn discordGatewayLoop(
                             }
                         }
                         const username = if (user.object.get("username")) |u|
-                            switch (u) { .string => |s| s, else => "unknown" }
-                        else "unknown";
+                            switch (u) {
+                                .string => |s| s,
+                                else => "unknown",
+                            }
+                        else
+                            "unknown";
                         try stdout.print("Discord: logged in as {s} (id={s})\n", .{ username, bot_id });
                     }
                 } else if (std.mem.eql(u8, event_type, "MESSAGE_CREATE")) {
@@ -509,9 +517,15 @@ fn discordGatewayLoop(
                     }
 
                     const content_val = d.object.get("content") orelse continue;
-                    const content_raw = switch (content_val) { .string => |s| s, else => continue };
+                    const content_raw = switch (content_val) {
+                        .string => |s| s,
+                        else => continue,
+                    };
                     const channel_id_val = d.object.get("channel_id") orelse continue;
-                    const channel_id = switch (channel_id_val) { .string => |s| s, else => continue };
+                    const channel_id = switch (channel_id_val) {
+                        .string => |s| s,
+                        else => continue,
+                    };
                     if (content_raw.len == 0) continue;
 
                     // Detect Direct Messages:
@@ -529,8 +543,7 @@ fn discordGatewayLoop(
                         break :blk false;
                     };
 
-                    if (debug) try stdout.print("[DEBUG] MESSAGE_CREATE ch={s} is_dm={} content=\"{s}\"\n",
-                        .{ channel_id, is_dm, if (content_raw.len > 100) content_raw[0..100] else content_raw });
+                    if (debug) try stdout.print("[DEBUG] MESSAGE_CREATE ch={s} is_dm={} content=\"{s}\"\n", .{ channel_id, is_dm, if (content_raw.len > 100) content_raw[0..100] else content_raw });
 
                     // Determine whether the bot was mentioned. Discord sends
                     // three kinds of mentions we want to catch:
@@ -546,9 +559,9 @@ fn discordGatewayLoop(
                     //      Since the bot presumably has that role, respond.
                     //   3. Content string fallback: search for <@BOT_ID> or
                     //      <@!BOT_ID> in case the arrays are missing.
-                    const mention        = try std.fmt.allocPrint(allocator, "<@{s}>",  .{bot_id});
+                    const mention = try std.fmt.allocPrint(allocator, "<@{s}>", .{bot_id});
                     defer allocator.free(mention);
-                    const mention_nick   = try std.fmt.allocPrint(allocator, "<@!{s}>", .{bot_id});
+                    const mention_nick = try std.fmt.allocPrint(allocator, "<@!{s}>", .{bot_id});
                     defer allocator.free(mention_nick);
 
                     const is_mentioned = is_dm or detect: {
@@ -578,7 +591,7 @@ fn discordGatewayLoop(
                         }
 
                         // 3. Content string fallback (<@BOT_ID> or <@!BOT_ID>).
-                        if (std.mem.indexOf(u8, content_raw, mention)      != null) break :detect true;
+                        if (std.mem.indexOf(u8, content_raw, mention) != null) break :detect true;
                         if (std.mem.indexOf(u8, content_raw, mention_nick) != null) break :detect true;
 
                         break :detect false;
@@ -608,7 +621,7 @@ fn discordGatewayLoop(
                         } else if (std.mem.startsWith(u8, stripped, "<@&")) {
                             // Role mention: find the closing '>' and strip past it.
                             if (std.mem.indexOf(u8, stripped, ">")) |end| {
-                                stripped = std.mem.trim(u8, stripped[end + 1..], " \t");
+                                stripped = std.mem.trim(u8, stripped[end + 1 ..], " \t");
                             }
                         }
                         break :blk stripped;
@@ -618,9 +631,14 @@ fn discordGatewayLoop(
                     // Get author username for logging.
                     const author_name = if (d.object.get("author")) |a|
                         if (a.object.get("username")) |u|
-                            switch (u) { .string => |s| s, else => "unknown" }
-                        else "unknown"
-                    else "unknown";
+                            switch (u) {
+                                .string => |s| s,
+                                else => "unknown",
+                            }
+                        else
+                            "unknown"
+                    else
+                        "unknown";
 
                     try stdout.print("Discord [{s}] {s}: {s}\n", .{ channel_id, author_name, content });
                     try stdout.print("Discord: generating reply...\n", .{});
@@ -641,9 +659,16 @@ fn discordGatewayLoop(
                     var reply_writer = reply_buf.writer();
 
                     agent_mod.runAgentWithHistory(
-                        allocator, cfg, any_provider,
-                        memory, tools, policy, mcp_pool,
-                        content, history, &reply_writer,
+                        allocator,
+                        cfg,
+                        any_provider,
+                        memory,
+                        tools,
+                        policy,
+                        mcp_pool,
+                        content,
+                        history,
+                        &reply_writer,
                     ) catch |err| {
                         reply_buf.clearRetainingCapacity();
                         try reply_buf.writer().print("error: {}", .{err});
@@ -719,7 +744,7 @@ fn tlsWsReadFrame(
 
     // const fin = (hdr[0] & 0x80) != 0;
     const opcode = hdr[0] & 0x0F;
-    const masked  = (hdr[1] & 0x80) != 0;
+    const masked = (hdr[1] & 0x80) != 0;
     var payload_len: u64 = hdr[1] & 0x7F;
 
     if (payload_len == 126) {
@@ -757,10 +782,10 @@ fn tlsWsReadFrame(
 
 /// Send a message to a Discord channel via REST API.
 fn discordSendMessage(
-    allocator:  std.mem.Allocator,
-    token:      []const u8,
+    allocator: std.mem.Allocator,
+    token: []const u8,
     channel_id: []const u8,
-    content:    []const u8,
+    content: []const u8,
 ) !void {
     // Chunk to 2000 chars (Discord limit).
     const chunk = if (content.len > 2000) content[0..2000] else content;
@@ -769,13 +794,16 @@ fn discordSendMessage(
     defer body_buf.deinit();
     var jw = std.json.writeStream(body_buf.writer(), .{ .whitespace = .minified });
     try jw.beginObject();
-    try jw.objectField("content"); try jw.write(chunk);
+    try jw.objectField("content");
+    try jw.write(chunk);
     try jw.endObject();
     const body = try body_buf.toOwnedSlice();
     defer allocator.free(body);
 
     const url = try std.fmt.allocPrint(
-        allocator, "{s}/channels/{s}/messages", .{ DISCORD_API, channel_id },
+        allocator,
+        "{s}/channels/{s}/messages",
+        .{ DISCORD_API, channel_id },
     );
     defer allocator.free(url);
 
@@ -790,13 +818,13 @@ fn discordSendMessage(
     defer resp_buf.deinit();
 
     _ = try client.fetch(.{
-        .method   = .POST,
+        .method = .POST,
         .location = .{ .uri = uri },
-        .headers  = .{
-            .content_type  = .{ .override = "application/json" },
+        .headers = .{
+            .content_type = .{ .override = "application/json" },
             .authorization = .{ .override = auth },
         },
-        .payload          = body,
+        .payload = body,
         .response_storage = .{ .dynamic = &resp_buf },
     });
 }
@@ -820,12 +848,12 @@ pub fn runTelegramChannel(cfg: *const config_mod.Config) !void {
     const stdout = std.io.getStdOut().writer();
 
     const token = std.process.getEnvVarOwned(allocator, "TELEGRAM_BOT_TOKEN") catch
-                  (if (cfg.telegram_token.len > 0)
-                      try allocator.dupe(u8, cfg.telegram_token)
-                  else {
-                      try stdout.print("Telegram: no bot token (set TELEGRAM_BOT_TOKEN or telegram_token in config)\n", .{});
-                      return;
-                  });
+        (if (cfg.telegram_token.len > 0)
+            try allocator.dupe(u8, cfg.telegram_token)
+        else {
+            try stdout.print("Telegram: no bot token (set TELEGRAM_BOT_TOKEN or telegram_token in config)\n", .{});
+            return;
+        });
     defer allocator.free(token);
 
     var stack = try buildStack(allocator, cfg);
@@ -862,7 +890,7 @@ fn telegramPollLoop(
         defer resp_buf.deinit();
 
         const result = client.fetch(.{
-            .method   = .GET,
+            .method = .GET,
             .location = .{ .uri = uri },
             .response_storage = .{ .dynamic = &resp_buf },
         }) catch |err| {
@@ -887,7 +915,10 @@ fn telegramPollLoop(
         if (ok_val != .bool or !ok_val.bool) continue;
 
         const results_val = parsed.value.object.get("result") orelse continue;
-        const updates = switch (results_val) { .array => |a| a, else => continue };
+        const updates = switch (results_val) {
+            .array => |a| a,
+            else => continue,
+        };
 
         for (updates.items) |update| {
             // Advance offset past this update.
@@ -897,10 +928,16 @@ fn telegramPollLoop(
 
             const message = update.object.get("message") orelse continue;
             const text_val = message.object.get("text") orelse continue;
-            const text = switch (text_val) { .string => |s| s, else => continue };
+            const text = switch (text_val) {
+                .string => |s| s,
+                else => continue,
+            };
             const chat_val = message.object.get("chat") orelse continue;
             const chat_id_val = chat_val.object.get("id") orelse continue;
-            const chat_id: i64 = switch (chat_id_val) { .integer => |i| i, else => continue };
+            const chat_id: i64 = switch (chat_id_val) {
+                .integer => |i| i,
+                else => continue,
+            };
 
             try stdout.print("Telegram [{d}]: {s}\n", .{ chat_id, text });
 
@@ -925,15 +962,17 @@ fn telegramPollLoop(
 
 fn telegramSendMessage(
     allocator: std.mem.Allocator,
-    token:     []const u8,
-    chat_id:   i64,
-    text:      []const u8,
+    token: []const u8,
+    chat_id: i64,
+    text: []const u8,
 ) !void {
     // Telegram message limit is 4096 chars.
     const chunk = if (text.len > 4096) text[0..4096] else text;
 
     const url = try std.fmt.allocPrint(
-        allocator, "{s}/bot{s}/sendMessage", .{ TELEGRAM_API, token },
+        allocator,
+        "{s}/bot{s}/sendMessage",
+        .{ TELEGRAM_API, token },
     );
     defer allocator.free(url);
 
@@ -941,8 +980,10 @@ fn telegramSendMessage(
     defer body_buf.deinit();
     var jw = std.json.writeStream(body_buf.writer(), .{ .whitespace = .minified });
     try jw.beginObject();
-    try jw.objectField("chat_id"); try jw.write(chat_id);
-    try jw.objectField("text");    try jw.write(chunk);
+    try jw.objectField("chat_id");
+    try jw.write(chat_id);
+    try jw.objectField("text");
+    try jw.write(chunk);
     try jw.endObject();
     const body = try body_buf.toOwnedSlice();
     defer allocator.free(body);
@@ -955,10 +996,10 @@ fn telegramSendMessage(
     defer resp_buf.deinit();
 
     _ = try client.fetch(.{
-        .method   = .POST,
+        .method = .POST,
         .location = .{ .uri = uri },
-        .headers  = .{ .content_type = .{ .override = "application/json" } },
-        .payload          = body,
+        .headers = .{ .content_type = .{ .override = "application/json" } },
+        .payload = body,
         .response_storage = .{ .dynamic = &resp_buf },
     });
 }
