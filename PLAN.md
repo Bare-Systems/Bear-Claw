@@ -17,7 +17,7 @@ Status: in progress
 
 - [x] add `bareclaw tardigrade` orchestration command as product entrypoint
 - [x] auto-launch local `bareclaw gateway` + external `tardigrade` process
-- [x] enforce HTTPS by default via Caddy TLS reverse-proxy sidecar
+- [ ] make Tardigrade itself the HTTPS edge and remove the current Caddy sidecar dependency
 - [x] auto-generate self-signed TLS cert/key when none provided
 - [x] generate bearer key, inject SHA-256 hash into Tardigrade env config
 - [x] print public endpoint + bearer key at startup for iPhone pairing
@@ -32,6 +32,9 @@ Status: in progress
   - `requires_confirmation` (default `false`)
   - `confirmation_reason` (default `null`)
 - [x] return structured error envelopes with `request_id`
+- [ ] add a deployment-oriented mode that writes or prints the direct Tardigrade env/config needed for manual or service-managed installs
+- [ ] verify the auth contract end-to-end against Tardigrade using `Authorization: Bearer`, matching the pairing payload and iOS client behavior
+- [ ] add a smoke/integration path that proves `BearClawiOS -> Tardigrade HTTPS -> BearClaw localhost gateway` without Caddy in the request path
 - [ ] enforce hard agent execution timeout with cancellation
 
 ---

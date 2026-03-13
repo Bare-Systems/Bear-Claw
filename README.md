@@ -478,15 +478,16 @@ bareclaw tardigrade --tardigrade-bin /path/to/tardigrade
 Optional flags:
 - `--host <host>` (default `0.0.0.0`)
 - `--port <port>` (default `8069`)
-- `--internal-port <port>` (default `18069`)
+- `--endpoint-host <host>` (override the host embedded in pairing/smoke output)
 - `--tls-cert <path>`
 - `--tls-key <path>`
-- `--caddy-bin <path>` (default `caddy`)
+- `--print-deploy-json`
+- `--print-deploy-env`
+- `--write-deploy-env <path>`
 
 This command:
 - starts local BearClaw gateway automatically
-- starts Tardigrade edge on an internal HTTP port
-- starts Caddy TLS reverse proxy in front of Tardigrade (HTTPS by default)
+- starts Tardigrade as the direct HTTPS edge in front of BearClaw
 - generates a bearer token and prints:
   - public endpoint (`http[s]://<public-ip>:<port>`)
   - bearer token for iPhone settings
@@ -494,6 +495,30 @@ This command:
   - pairing payload JSON and compact `tardi1:` pairing code
 
 If `--tls-cert`/`--tls-key` are not provided, BearClaw generates a self-signed certificate under `~/.bareclaw/tls/` using `openssl`.
+
+For manual or service-managed installs, use deployment mode instead of spawning
+the processes directly:
+
+```bash
+bareclaw tardigrade --print-deploy-json --endpoint-host 127.0.0.1
+bareclaw tardigrade --print-deploy-env
+bareclaw tardigrade --write-deploy-env /etc/bareclaw/tardigrade.env
+```
+
+Those modes print or write the direct Tardigrade env block BearClaw expects,
+along with:
+- pairing payload JSON and `tardi1:` code for the iOS app
+- the bearer token and cert fingerprint
+- a smoke-test `curl` command that uses `Authorization: Bearer ...` and `--cacert`
+
+`--print-deploy-json` emits one machine-readable JSON object containing:
+- `endpoint`
+- `bearer_token`
+- `cert_sha256`
+- `tls_cert_path`
+- `tls_key_path`
+- `deploy_env`
+- `deploy_env_path` (or `null` when not writing a file)
 
 Pairing payload format:
 
