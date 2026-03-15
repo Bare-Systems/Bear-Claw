@@ -11,6 +11,26 @@ This document is grouped into three tiers:
 
 ---
 
+## Portfolio Alignment (Iterations 1-2)
+
+This section tracks only the BearClaw-owned items assigned in `PORTFOLIO-PRIORITY.md`.
+
+### Iteration 1 (Weeks 1-2): Tier-1 reliability/security fixes
+
+- [ ] Tool-call parsing robustness
+- [ ] Context budget limits
+- [ ] Shell injection hardening for git tool
+- [ ] MCP startup error surfacing
+- [ ] Agent-loop test coverage
+
+### Iteration 2 (Weeks 3-4): Gateway + automation wiring
+
+- [x] Production-grade gateway middleware baseline (auth/validation/audit)
+- [ ] Cron-to-agent prompt execution path
+- [ ] Transcript/session persistence in BearClaw runtime
+
+---
+
 ## Remote Secure Access MVP Track (Tardigrade -> BearClaw)
 
 Status: in progress
