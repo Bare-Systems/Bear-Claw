@@ -5,9 +5,17 @@ zig-out/
 
 # Agent Context
 changes/
+.cursor/
 AGENTS.md
 PLAN.md
 CLAUDE.md
 .claude/worktrees/
 ROADMAP.md
+PORTFOLIO.md
+CONTEXTS.md
 deploy/
+PLAN-TEST*.md
+PLAN*.md
+
+# Deployment symlink
+suite/
