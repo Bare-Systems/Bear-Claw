@@ -2,3 +2,12 @@
 zig-out/
 *.o
 .env
+
+# Agent Context
+changes/
+AGENTS.md
+PLAN.md
+CLAUDE.md
+.claude/worktrees/
+ROADMAP.md
+deploy/
