@@ -565,13 +565,13 @@ journalctl --user -u bearclaw.service -f
 
 On the `blink` homelab deployment, the staged unit file and installer live at:
 
-- `/home/admin/barelabs/runtime/blink-homelab/systemd-user/bearclaw.service`
-- `/home/admin/barelabs/runtime/blink-homelab/install_user_systemd_units.sh`
+- `/home/admin/baresystems/runtime/blink-homelab/systemd-user/bearclaw.service`
+- `/home/admin/baresystems/runtime/blink-homelab/install_user_systemd_units.sh`
 
 After enabling lingering for `admin`, install the staged units with:
 
 ```bash
-/home/admin/barelabs/runtime/blink-homelab/install_user_systemd_units.sh enable
+/home/admin/baresystems/runtime/blink-homelab/install_user_systemd_units.sh enable
 ```
 
 Paste this payload (or the `tardi1:` code) into the iOS app Pairing section. The app pins `cert_sha256` and uses it for TLS trust.
