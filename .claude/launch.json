@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "bearclaw-web",
+      "runtimeExecutable": ".claude/scripts/bearclaw-web-preview.sh",
+      "runtimeArgs": [],
+      "port": 5173
+    }
+  ]
+}

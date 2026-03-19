@@ -1,0 +1,48 @@
+[blink]
+version = "1"
+
+[targets.homelab]
+type         = "ssh"
+host         = "blink"
+user         = "admin"
+base         = "/home/admin/baresystems"
+runtime_dir  = "/home/admin/baresystems/runtime/blink-homelab"
+binary_rel   = "runtime/blink-homelab/bin/bareclaw"
+binary_path  = "/home/admin/baresystems/runtime/blink-homelab/bin/bareclaw"
+service_name = "bearclaw"
+
+[services.bearclaw]
+description = "BearClaw daemon on the blink homelab host"
+port        = "6701"
+
+[services.bearclaw.source]
+type     = "local_build"
+workdir  = "."
+command  = "zig build"
+artifact = "zig-out/bin/bareclaw"
+
+[services.bearclaw.deploy]
+target            = "homelab"
+pipeline          = ["fetch_artifact", "remote_script", "stop", "backup", "install", "start", "health_check", "verify"]
+rollback_pipeline = ["rollback", "start", "health_check"]
+
+[services.bearclaw.remote_script]
+path = "deploy/blink/provision_remote.sh"
+
+[services.bearclaw.stop]
+command = "env XDG_RUNTIME_DIR=/run/user/$(id -u) systemctl --user stop {{service_name}}.service || true"
+
+[services.bearclaw.install]
+dest = "runtime/blink-homelab/bin/bareclaw"
+
+[services.bearclaw.start]
+command = "env XDG_RUNTIME_DIR=/run/user/$(id -u) systemctl --user daemon-reload && env XDG_RUNTIME_DIR=/run/user/$(id -u) systemctl --user enable --now {{service_name}}.service"
+
+[services.bearclaw.health_check]
+url      = "http://127.0.0.1:{{port}}/health"
+timeout  = 30
+interval = 2
+
+[services.bearclaw.verify]
+suite = "blink/suites/bearclaw_homelab.rb"
+tags  = ["smoke", "health"]
