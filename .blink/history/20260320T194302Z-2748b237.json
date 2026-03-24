@@ -1,0 +1,70 @@
+{
+  "run_id": "20260320T194302Z-2748b237",
+  "manifest": "/Users/joecaruso/Projects/BareSystems/BearClaw/blink.toml",
+  "service": "bearclaw",
+  "operation": "test",
+  "status": "failure",
+  "summary": "2/4 passed, 1 failed, 1 errored",
+  "started_at": "2026-03-20T19:43:02Z",
+  "completed_at": "2026-03-20T19:43:03Z",
+  "duration": 1.006,
+  "dry_run": false,
+  "tags": [],
+  "target": {
+    "name": "homelab",
+    "description": "ssh://admin@blink",
+    "type": "ssh"
+  },
+  "test_summary": {
+    "success": false,
+    "passed": 2,
+    "failed": 1,
+    "errored": 1,
+    "skipped": 0,
+    "total": 4,
+    "tests": [
+      {
+        "name": "health endpoint returns 200",
+        "suite": "BearClaw Homelab",
+        "tags": [
+          "smoke",
+          "health"
+        ],
+        "status": "pass",
+        "elapsed": 0.244,
+        "message": null
+      },
+      {
+        "name": "health payload identifies bareclaw",
+        "suite": "BearClaw Homelab",
+        "tags": [
+          "smoke"
+        ],
+        "status": "fail",
+        "elapsed": 0.267,
+        "message": "expected body to include \"bareclaw\"\n     body: \"curl/target error: Remote capture failed: \""
+      },
+      {
+        "name": "systemd user unit is active",
+        "suite": "BearClaw Homelab",
+        "tags": [
+          "health"
+        ],
+        "status": "error",
+        "elapsed": 0.267,
+        "message": "Blink::SSHError: Remote capture failed: "
+      },
+      {
+        "name": "bearclaw is bound to port 8080",
+        "suite": "BearClaw Homelab",
+        "tags": [
+          "health"
+        ],
+        "status": "pass",
+        "elapsed": 0.227,
+        "message": null
+      }
+    ]
+  },
+  "config_hash": "6f85e4d00d0e8e6b6b37331abe71e5802c32a86562e7f7dcd7c49a63a4ffcfd0"
+}

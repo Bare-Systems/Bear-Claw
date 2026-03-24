@@ -1,0 +1,70 @@
+{
+  "run_id": "20260320T194533Z-b3f172f9",
+  "manifest": "/Users/joecaruso/Projects/BareSystems/BearClaw/blink.toml",
+  "service": "bearclaw",
+  "operation": "test",
+  "status": "success",
+  "summary": "4/4 passed",
+  "started_at": "2026-03-20T19:45:33Z",
+  "completed_at": "2026-03-20T19:45:34Z",
+  "duration": 0.848,
+  "dry_run": false,
+  "tags": [],
+  "target": {
+    "name": "homelab",
+    "description": "ssh://admin@blink",
+    "type": "ssh"
+  },
+  "test_summary": {
+    "success": true,
+    "passed": 4,
+    "failed": 0,
+    "errored": 0,
+    "skipped": 0,
+    "total": 4,
+    "tests": [
+      {
+        "name": "health endpoint returns 200",
+        "suite": "BearClaw Homelab",
+        "tags": [
+          "smoke",
+          "health"
+        ],
+        "status": "pass",
+        "elapsed": 0.211,
+        "message": null
+      },
+      {
+        "name": "health payload identifies bareclaw",
+        "suite": "BearClaw Homelab",
+        "tags": [
+          "smoke"
+        ],
+        "status": "pass",
+        "elapsed": 0.212,
+        "message": null
+      },
+      {
+        "name": "systemd user unit is active",
+        "suite": "BearClaw Homelab",
+        "tags": [
+          "health"
+        ],
+        "status": "pass",
+        "elapsed": 0.215,
+        "message": null
+      },
+      {
+        "name": "bearclaw is bound to port 8080",
+        "suite": "BearClaw Homelab",
+        "tags": [
+          "health"
+        ],
+        "status": "pass",
+        "elapsed": 0.209,
+        "message": null
+      }
+    ]
+  },
+  "config_hash": "ca78723217a870f65f7dd45e1abc25ddf7a3e772962952548d72219bb1537bfb"
+}

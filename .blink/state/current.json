@@ -1,0 +1,76 @@
+{
+  "updated_at": "2026-03-21T01:25:03Z",
+  "services": {
+    "bearclaw": {
+      "last_run_id": "20260321T012502Z-e71e66e2",
+      "last_run": {
+        "run_id": "20260321T012502Z-e71e66e2",
+        "service": "bearclaw",
+        "operation": "test",
+        "status": "success",
+        "started_at": "2026-03-21T01:25:02Z",
+        "completed_at": "2026-03-21T01:25:03Z",
+        "summary": "4/4 passed"
+      },
+      "last_test": {
+        "run_id": "20260321T012502Z-e71e66e2",
+        "completed_at": "2026-03-21T01:25:03Z",
+        "target": "ssh://admin@blink",
+        "tags": [],
+        "summary": "4/4 passed",
+        "success": true,
+        "result": {
+          "success": true,
+          "passed": 4,
+          "failed": 0,
+          "errored": 0,
+          "skipped": 0,
+          "total": 4,
+          "tests": [
+            {
+              "name": "health endpoint returns 200",
+              "suite": "BearClaw Homelab",
+              "tags": [
+                "smoke",
+                "health"
+              ],
+              "status": "pass",
+              "elapsed": 0.244,
+              "message": null
+            },
+            {
+              "name": "health payload identifies bareclaw",
+              "suite": "BearClaw Homelab",
+              "tags": [
+                "smoke"
+              ],
+              "status": "pass",
+              "elapsed": 0.247,
+              "message": null
+            },
+            {
+              "name": "systemd user unit is active",
+              "suite": "BearClaw Homelab",
+              "tags": [
+                "health"
+              ],
+              "status": "pass",
+              "elapsed": 0.237,
+              "message": null
+            },
+            {
+              "name": "bearclaw is bound to port 8080",
+              "suite": "BearClaw Homelab",
+              "tags": [
+                "health"
+              ],
+              "status": "pass",
+              "elapsed": 0.237,
+              "message": null
+            }
+          ]
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,258 @@
+{
+  "run_id": "20260320T192939Z-01cb2945",
+  "manifest": "/Users/joecaruso/Projects/BareSystems/BearClaw/blink.toml",
+  "service": "bearclaw",
+  "operation": "build",
+  "status": "failure",
+  "summary": "Build failed at step: fetch_artifact",
+  "started_at": "2026-03-20T19:29:39Z",
+  "completed_at": "2026-03-20T19:30:35Z",
+  "duration": 55.746,
+  "dry_run": false,
+  "version": "latest",
+  "build_name": "local_docker",
+  "artifact": {
+    "path": null,
+    "sha256": null,
+    "size": null,
+    "cached": false
+  },
+  "git": {
+    "commit": "1cce2a05e679738449730d4529b9b474dd187f5d",
+    "ref": "main",
+    "dirty": true
+  },
+  "target": {
+    "name": "homelab",
+    "description": "ssh://admin@blink",
+    "type": "ssh",
+    "install_path": "runtime/blink-homelab/bin/bareclaw"
+  },
+  "runtime": {
+    "health_url": "http://127.0.0.1:{{port}}/health",
+    "service_name": "bearclaw"
+  },
+  "pipeline": {
+    "declared": [
+      "fetch_artifact"
+    ],
+    "failed_at": "fetch_artifact",
+    "warnings": [
+      "build.target is not set; Blink will use the default target."
+    ],
+    "blockers": [],
+    "steps": [
+      {
+        "step": "fetch_artifact",
+        "status": "fail",
+        "started_at": "2026-03-20T19:29:39Z",
+        "completed_at": "2026-03-20T19:30:35Z",
+        "error": "service 'bearclaw' source 'containerized_local_build': container command exited non-zero: docker run --rm -v /Users/joecaruso/Projects/BareSystems/BearClaw:/workspace -v /var/run/docker.sock:/var/run/docker.sock -w /workspace docker:cli sh -lc docker build -f Dockerfile.build -t bareclaw-builder:latest . && docker run --rm --platform linux/amd64 -v /workspace:/src -w /src/edge bareclaw-builder:latest zig build -Doptimize=ReleaseFast",
+        "elapsed": 55.746,
+        "definition": {
+          "name": "fetch_artifact",
+          "class_name": "Blink::Steps::FetchArtifact",
+          "description": "Fetch a deployable artifact from the configured source.",
+          "config_section": "source",
+          "required_keys": [],
+          "supported_target_types": [
+            "local",
+            "ssh"
+          ],
+          "rollback_supported": false,
+          "rollback_strategy": "none",
+          "mutates_context": [
+            "artifact_path"
+          ]
+        }
+      }
+    ],
+    "rollback_steps": []
+  },
+  "plan": {
+    "success": true,
+    "service": "bearclaw",
+    "operation": "build",
+    "build_name": "local_docker",
+    "manifest": "/Users/joecaruso/Projects/BareSystems/BearClaw/blink.toml",
+    "description": "BearClaw daemon on the blink homelab host",
+    "target": {
+      "name": "homelab",
+      "type": "ssh",
+      "description": "ssh://admin@blink",
+      "base": "/home/admin/baresystems"
+    },
+    "source": {
+      "default": "local_docker",
+      "builds": {
+        "local_docker": {
+          "type": "containerized_local_build",
+          "image": "docker:cli",
+          "mount": ".:/workspace",
+          "workdir": "/workspace",
+          "command": "docker build -f Dockerfile.build -t bareclaw-builder:latest . && docker run --rm --platform linux/amd64 -v /workspace:/src -w /src/edge bareclaw-builder:latest zig build -Doptimize=ReleaseFast",
+          "artifact": "edge/zig-out/bin/bareclaw",
+          "docker_socket": true
+        },
+        "github": {
+          "type": "github_release",
+          "repo": "Bare-Labs/BearClaw",
+          "asset": "bareclaw-linux-x86_64"
+        }
+      }
+    },
+    "pipeline": [
+      "fetch_artifact"
+    ],
+    "rollback": [],
+    "steps": [
+      {
+        "step": "fetch_artifact",
+        "config": {},
+        "note": "",
+        "definition": {
+          "name": "fetch_artifact",
+          "class_name": "Blink::Steps::FetchArtifact",
+          "description": "Fetch a deployable artifact from the configured source.",
+          "config_section": "source",
+          "required_keys": [],
+          "supported_target_types": [
+            "local",
+            "ssh"
+          ],
+          "rollback_supported": false,
+          "rollback_strategy": "none",
+          "mutates_context": [
+            "artifact_path"
+          ]
+        }
+      }
+    ],
+    "rollback_steps": [],
+    "warnings": [
+      "build.target is not set; Blink will use the default target."
+    ],
+    "blockers": [],
+    "security": {
+      "applicable": false,
+      "remote": false,
+      "type": "multi_source"
+    },
+    "config_hash": "269e5283caefb075e1118739d2ddd0ed2304de9d29db24480332f104bc2d5bc4",
+    "resolved_config": {
+      "build_name": "local_docker",
+      "operation": "build",
+      "pipeline": [
+        "fetch_artifact"
+      ],
+      "rollback_pipeline": [],
+      "security": {
+        "applicable": false,
+        "remote": false,
+        "type": "multi_source"
+      },
+      "service": "bearclaw",
+      "service_config": {
+        "deploy": {
+          "pipeline": [
+            "fetch_artifact",
+            "remote_script",
+            "stop",
+            "backup",
+            "install",
+            "start",
+            "health_check",
+            "verify"
+          ],
+          "rollback_pipeline": [
+            "rollback",
+            "start",
+            "health_check"
+          ],
+          "target": "homelab"
+        },
+        "description": "BearClaw daemon on the blink homelab host",
+        "health_check": {
+          "interval": 2,
+          "timeout": 30,
+          "url": "http://127.0.0.1:{{port}}/health"
+        },
+        "install": {
+          "dest": "runtime/blink-homelab/bin/bareclaw"
+        },
+        "port": "6701",
+        "remote_script": {
+          "path": "deploy/blink/provision_remote.sh"
+        },
+        "source": {
+          "builds": {
+            "github": {
+              "asset": "bareclaw-linux-x86_64",
+              "repo": "Bare-Labs/BearClaw",
+              "type": "github_release"
+            },
+            "local_docker": {
+              "artifact": "edge/zig-out/bin/bareclaw",
+              "command": "docker build -f Dockerfile.build -t bareclaw-builder:latest . && docker run --rm --platform linux/amd64 -v /workspace:/src -w /src/edge bareclaw-builder:latest zig build -Doptimize=ReleaseFast",
+              "docker_socket": true,
+              "image": "docker:cli",
+              "mount": ".:/workspace",
+              "type": "containerized_local_build",
+              "workdir": "/workspace"
+            }
+          },
+          "default": "local_docker"
+        },
+        "start": {
+          "command": "env XDG_RUNTIME_DIR=/run/user/$(id -u) systemctl --user daemon-reload && env XDG_RUNTIME_DIR=/run/user/$(id -u) systemctl --user enable --now {{service_name}}.service"
+        },
+        "stop": {
+          "command": "env XDG_RUNTIME_DIR=/run/user/$(id -u) systemctl --user stop {{service_name}}.service || true"
+        },
+        "verify": {
+          "suite": "blink/suites/bearclaw_homelab.rb",
+          "tags": [
+            "smoke",
+            "health"
+          ]
+        }
+      },
+      "source": {
+        "builds": {
+          "github": {
+            "asset": "bareclaw-linux-x86_64",
+            "repo": "Bare-Labs/BearClaw",
+            "type": "github_release"
+          },
+          "local_docker": {
+            "artifact": "edge/zig-out/bin/bareclaw",
+            "command": "docker build -f Dockerfile.build -t bareclaw-builder:latest . && docker run --rm --platform linux/amd64 -v /workspace:/src -w /src/edge bareclaw-builder:latest zig build -Doptimize=ReleaseFast",
+            "docker_socket": true,
+            "image": "docker:cli",
+            "mount": ".:/workspace",
+            "type": "containerized_local_build",
+            "workdir": "/workspace"
+          }
+        },
+        "default": "local_docker"
+      },
+      "target": {
+        "base": "/home/admin/baresystems",
+        "config": {
+          "base": "/home/admin/baresystems",
+          "binary_path": "/home/admin/baresystems/runtime/blink-homelab/bin/bareclaw",
+          "binary_rel": "runtime/blink-homelab/bin/bareclaw",
+          "host": "blink",
+          "runtime_dir": "/home/admin/baresystems/runtime/blink-homelab",
+          "service_name": "bearclaw",
+          "type": "ssh",
+          "user": "admin"
+        },
+        "description": "ssh://admin@blink",
+        "name": "homelab",
+        "type": "ssh"
+      }
+    }
+  },
+  "config_hash": "269e5283caefb075e1118739d2ddd0ed2304de9d29db24480332f104bc2d5bc4"
+}

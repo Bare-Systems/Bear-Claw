@@ -3,12 +3,20 @@ import {
   initialSecurityCards,
   initialSecurityEvents,
   initialWeatherTimeline,
+  previewClimateSnapshot,
+  previewLiveDashboard,
   systemPrompts,
 } from '../data/mockData'
 import type {
+  ActivityItem,
   AppSettings,
   ChatMessage,
   ChatResponse,
+  ClimateSnapshot,
+  DashboardSnapshot,
+  KoalaCameraCard,
+  KoalaStatItem,
+  PolarQualityFlag,
   PolarReading,
   SecurityEvent,
   SecuritySnapshot,
@@ -256,6 +264,13 @@ function previewBearClawReply(message: string): ChatResponse {
   }
 }
 
+export function toneFromQuality(quality: PolarQualityFlag): Tone {
+  if (quality === 'good') return 'healthy'
+  if (quality === 'outlier') return 'warning'
+  if (quality === 'unavailable') return 'critical'
+  return 'neutral'
+}
+
 export function getDefaultSettings(): AppSettings {
   return {
     authToken: import.meta.env.VITE_ADMIN_TOKEN ?? '',
@@ -270,6 +285,10 @@ export function getDefaultSettings(): AppSettings {
     polar: {
       baseUrl: import.meta.env.VITE_POLAR_API_BASE_URL ?? '',
       token: import.meta.env.VITE_POLAR_TOKEN ?? '',
+    },
+    koalaLive: {
+      viewerName: 'Home',
+      notificationsEnabled: true,
     },
   }
 }
@@ -426,6 +445,191 @@ export function createKoalaAdminClient(settings: AppSettings) {
         body: `Confidence ${formatNumber(response.data.confidence * 100)}% · freshness ${response.status}.`,
         timeLabel: formatIsoLabel(response.data.observed_at),
         tone: response.data.package_present ? 'warning' : 'healthy',
+      }
+    },
+  }
+}
+
+export function createKoalaLiveClient(settings: AppSettings) {
+  const baseUrl = normalizeBaseUrl(settings.koala.baseUrl)
+  const token = serviceToken(settings.authToken, settings.koala.token)
+  const polarBaseUrl = normalizeBaseUrl(settings.polar.baseUrl)
+  const polarToken = serviceToken(settings.authToken, settings.polar.token)
+
+  async function postTool<T>(tool: string, input: Record<string, unknown> = {}) {
+    return requestJson<ToolEnvelope<T>>(`${baseUrl}/mcp/tools/${tool}`, {
+      method: 'POST',
+      headers: buildHeaders(token),
+      body: JSON.stringify({ input }),
+    })
+  }
+
+  function buildCameraCards(
+    cameras: KoalaCamera[],
+    ingest: KoalaIngestStatus,
+  ): KoalaCameraCard[] {
+    return cameras.map((camera) => {
+      const ingestCamera = ingest.cameras[camera.id]
+      const captureLabel = formatIsoLabel(ingestCamera?.last_capture_at)
+      const detailParts = [
+        ingestCamera?.last_error ? `Last error: ${ingestCamera.last_error}` : undefined,
+        captureLabel !== 'unknown' ? `Last capture ${captureLabel}` : undefined,
+        ingestCamera ? `${ingestCamera.consecutive_failures} consecutive failures` : undefined,
+      ].filter(Boolean)
+
+      return {
+        id: camera.id,
+        name: camera.name || camera.id,
+        zoneLabel: camera.zone_id,
+        statusLabel: ingestCamera?.last_status || camera.status,
+        detail: detailParts.join(' · ') || 'Camera reachable with no recent incidents.',
+        tone: toneFromStatus(ingestCamera?.last_status || camera.status),
+        snapshotUrl: baseUrl
+          ? `${baseUrl}/admin/cameras/${camera.id}/snapshot?token=${encodeURIComponent(token)}`
+          : undefined,
+      }
+    })
+  }
+
+  function buildLiveStats(
+    health: KoalaHealth,
+    cameras: KoalaCamera[],
+    packageState: KoalaPackageState,
+  ): KoalaStatItem[] {
+    const online = cameras.filter((camera) => camera.status === 'available').length
+    return [
+      {
+        label: 'System',
+        value: health.status,
+        detail: `Inference ${health.inference} · MCP ${health.mcp}`,
+        tone: toneFromStatus(health.status),
+      },
+      {
+        label: 'Package',
+        value: packageState.package_present ? 'Detected' : 'Clear',
+        detail: `Confidence ${formatNumber(packageState.confidence * 100)}%`,
+        tone: packageState.package_present ? 'warning' : 'healthy',
+      },
+      {
+        label: 'Cameras',
+        value: `${online}/${cameras.length} online`,
+        detail: 'Current live roster reachability',
+        tone: online === cameras.length ? 'healthy' : 'warning',
+      },
+    ]
+  }
+
+  function buildLiveActivity(
+    zoneState: KoalaZoneState,
+    packageState: KoalaPackageState,
+    ingest: KoalaIngestStatus,
+  ): ActivityItem[] {
+    const items: ActivityItem[] = [
+      {
+        id: `package-${packageState.observed_at}`,
+        title: packageState.package_present ? 'Package detected' : 'Front door clear',
+        body: `Observed ${formatIsoLabel(packageState.observed_at)} with ${formatNumber(packageState.confidence * 100)}% confidence.`,
+        timeLabel: formatIsoLabel(packageState.observed_at),
+        tone: packageState.package_present ? 'warning' : 'healthy',
+        saveKey: `package-${packageState.observed_at}`,
+      },
+      {
+        id: `zone-${zoneState.observed_at}`,
+        title: 'Front door zone refreshed',
+        body: `${zoneState.entities.length} entities detected in ${zoneState.zone_id}.`,
+        timeLabel: formatIsoLabel(zoneState.observed_at),
+        tone: zoneState.stale ? 'warning' : 'healthy',
+        saveKey: `zone-${zoneState.observed_at}`,
+      },
+    ]
+
+    for (const incident of ingest.incidents.slice(0, 6)) {
+      items.push({
+        id: `${incident.camera_id}-${incident.occurred_at}-${incident.type}`,
+        title: `${incident.camera_id}: ${incident.type.replaceAll('_', ' ')}`,
+        body: incident.message,
+        timeLabel: formatIsoLabel(incident.occurred_at),
+        tone: toneFromStatus(incident.severity),
+        saveKey: `${incident.camera_id}-${incident.occurred_at}-${incident.type}`,
+      })
+    }
+
+    return items
+  }
+
+  return {
+    async loadDashboard(): Promise<DashboardSnapshot> {
+      if (!canRequest(baseUrl)) {
+        return previewLiveDashboard
+      }
+
+      const [health, cameras, zoneState, packageState, ingest] = await Promise.all([
+        postTool<KoalaHealth>('koala.get_system_health'),
+        postTool<{ cameras: KoalaCamera[] }>('koala.list_cameras'),
+        postTool<KoalaZoneState>('koala.get_zone_state', { zone_id: 'front_door' }),
+        postTool<KoalaPackageState>('koala.check_package_at_door'),
+        requestJson<ToolEnvelope<KoalaIngestStatus>>(`${baseUrl}/admin/ingest/status`, {
+          method: 'GET',
+          headers: buildHeaders(token, false),
+        }),
+      ])
+
+      const cameraCards = buildCameraCards(cameras.data.cameras, ingest.data)
+      const stats = buildLiveStats(health.data, cameras.data.cameras, packageState.data)
+      const activity = buildLiveActivity(zoneState.data, packageState.data, ingest.data)
+
+      return {
+        headline: packageState.data.package_present
+          ? 'Package waiting at the door'
+          : 'Home looks calm right now',
+        subheadline:
+          health.status === 'ok'
+            ? 'Koala Live is connected to the current home security state.'
+            : 'Koala is reachable but parts of the system are degraded.',
+        packageSummary: packageState.data.package_present
+          ? `Package detected with ${formatNumber(packageState.data.confidence * 100)}% confidence.`
+          : 'No package detected at the front door.',
+        zoneSummary: `${zoneState.data.entities.length} entities tracked in ${zoneState.data.zone_id}.`,
+        serviceLabel: health.status,
+        serviceTone: toneFromStatus(health.status),
+        stats,
+        cameras: cameraCards,
+        devices: [],
+        activity,
+        lastUpdatedLabel: formatIsoLabel(zoneState.data.observed_at),
+      }
+    },
+
+    async loadClimate(): Promise<ClimateSnapshot> {
+      if (!canRequest(polarBaseUrl)) {
+        return previewClimateSnapshot
+      }
+      return requestJson<ClimateSnapshot>(`${polarBaseUrl}/v1/climate/snapshot`, {
+        method: 'GET',
+        headers: buildHeaders(polarToken, false),
+      })
+    },
+
+    async checkPackage(): Promise<ActivityItem> {
+      if (!canRequest(baseUrl)) {
+        return {
+          id: 'preview-package-check',
+          title: 'Preview package check',
+          body: 'Connect a Koala service to run a live package check.',
+          timeLabel: 'preview',
+          tone: 'neutral',
+          saveKey: 'preview-package-check',
+        }
+      }
+
+      const packageState = await postTool<KoalaPackageState>('koala.check_package_at_door')
+      return {
+        id: crypto.randomUUID(),
+        title: packageState.data.package_present ? 'Package detected' : 'Package check clear',
+        body: `Observed ${formatIsoLabel(packageState.data.observed_at)} with ${formatNumber(packageState.data.confidence * 100)}% confidence.`,
+        timeLabel: formatIsoLabel(packageState.data.observed_at),
+        tone: packageState.data.package_present ? 'warning' : 'healthy',
+        saveKey: `package-${packageState.data.observed_at}`,
       }
     },
   }

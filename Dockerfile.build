@@ -1,0 +1,27 @@
+# BearClaw build environment
+# Usage: docker buildx build --platform linux/amd64 --load -f Dockerfile.build -t bareclaw-builder:latest .
+#        docker run --rm --platform linux/amd64 -v "$PWD:/src" -w /src/edge bareclaw-builder:latest zig build -Doptimize=ReleaseFast
+#
+# The compiled binary will appear at edge/zig-out/bin/bareclaw on the host.
+
+FROM debian:bookworm-slim
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libsqlite3-dev \
+    wget \
+    xz-utils \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install Zig 0.14.1 for x86_64 Linux.
+# Zig 0.14.1 uses the `zig-x86_64-linux-*` artifact naming scheme.
+RUN wget -q https://ziglang.org/download/0.14.1/zig-x86_64-linux-0.14.1.tar.xz \
+    && tar -xf zig-x86_64-linux-0.14.1.tar.xz \
+    && mv zig-x86_64-linux-0.14.1 /usr/local/zig \
+    && rm zig-x86_64-linux-0.14.1.tar.xz
+
+ENV PATH="/usr/local/zig:$PATH"
+
+WORKDIR /src/edge
+
+CMD ["zig", "build", "-Doptimize=ReleaseFast"]

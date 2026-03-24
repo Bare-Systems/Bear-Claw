@@ -1,0 +1,83 @@
+[
+  {
+    "run_id": "20260321T012502Z-e71e66e2",
+    "service": "bearclaw",
+    "operation": "test",
+    "status": "success",
+    "started_at": "2026-03-21T01:25:02Z",
+    "completed_at": "2026-03-21T01:25:03Z",
+    "summary": "4/4 passed"
+  },
+  {
+    "run_id": "20260320T194533Z-b3f172f9",
+    "service": "bearclaw",
+    "operation": "test",
+    "status": "success",
+    "started_at": "2026-03-20T19:45:33Z",
+    "completed_at": "2026-03-20T19:45:34Z",
+    "summary": "4/4 passed"
+  },
+  {
+    "run_id": "20260320T194302Z-2748b237",
+    "service": "bearclaw",
+    "operation": "test",
+    "status": "failure",
+    "started_at": "2026-03-20T19:43:02Z",
+    "completed_at": "2026-03-20T19:43:03Z",
+    "summary": "2/4 passed, 1 failed, 1 errored"
+  },
+  {
+    "run_id": "20260320T194000Z-a04e463f",
+    "service": "bearclaw",
+    "operation": "test",
+    "status": "success",
+    "started_at": "2026-03-20T19:40:00Z",
+    "completed_at": "2026-03-20T19:40:01Z",
+    "summary": "4/4 passed"
+  },
+  {
+    "run_id": "20260320T193542Z-9f3d2510",
+    "service": "bearclaw",
+    "operation": "test",
+    "status": "success",
+    "started_at": "2026-03-20T19:35:42Z",
+    "completed_at": "2026-03-20T19:35:43Z",
+    "summary": "4/4 passed"
+  },
+  {
+    "run_id": "20260320T193308Z-e9b9ef2a",
+    "service": "bearclaw",
+    "operation": "build",
+    "status": "success",
+    "started_at": "2026-03-20T19:33:08Z",
+    "completed_at": "2026-03-20T19:33:59Z",
+    "summary": "Build succeeded"
+  },
+  {
+    "run_id": "20260320T193059Z-a113c251",
+    "service": "bearclaw",
+    "operation": "build",
+    "status": "failure",
+    "started_at": "2026-03-20T19:30:59Z",
+    "completed_at": "2026-03-20T19:32:26Z",
+    "summary": "Build failed at step: fetch_artifact"
+  },
+  {
+    "run_id": "20260320T192939Z-01cb2945",
+    "service": "bearclaw",
+    "operation": "build",
+    "status": "failure",
+    "started_at": "2026-03-20T19:29:39Z",
+    "completed_at": "2026-03-20T19:30:35Z",
+    "summary": "Build failed at step: fetch_artifact"
+  },
+  {
+    "run_id": "20260320T192832Z-c46b98fe",
+    "service": "bearclaw",
+    "operation": "build",
+    "status": "failure",
+    "started_at": "2026-03-20T19:28:32Z",
+    "completed_at": "2026-03-20T19:28:41Z",
+    "summary": "Build failed at step: fetch_artifact"
+  }
+]

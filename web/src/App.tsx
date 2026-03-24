@@ -3,16 +3,24 @@ import './App.css'
 import {
   createBearClawClient,
   createKoalaAdminClient,
+  createKoalaLiveClient,
   createPolarAdminClient,
   getDefaultSettings,
+  toneFromQuality,
 } from './api/clients'
 import {
+  ActivityList,
   ActivityTimeline,
+  CameraCardView,
+  DeviceRow,
   NavRail,
   Panel,
   QuickActionButton,
   ServiceBadge,
   StatCard,
+  StatusPill,
+  ToggleRow,
+  type DeviceAction,
 } from './components/ui'
 import {
   initialAlerts,
@@ -23,14 +31,19 @@ import {
   initialSecurityEvents,
   initialSystemSummary,
   initialWeatherTimeline,
+  previewClimateSnapshot,
+  previewLiveDashboard,
   quickPrompts,
 } from './data/mockData'
 import type {
+  ActivityItem,
   AdminActionId,
   AlertItem,
   AppSettings,
   AppTab,
   ChatMessage,
+  ClimateSnapshot,
+  DashboardSnapshot,
   FinanceMetric,
   PolarReading,
   SecurityEvent,
@@ -39,6 +52,8 @@ import type {
   TimelineItem,
   Tone,
 } from './lib/types'
+
+const liveStorageKey = 'koala-live-saved-moments'
 
 const storageKey = 'bearclaw-web-settings'
 
@@ -60,6 +75,10 @@ function mergeSettings(defaults: AppSettings, parsed: Partial<AppSettings>): App
     polar: {
       ...defaults.polar,
       ...parsed.polar,
+    },
+    koalaLive: {
+      ...defaults.koalaLive,
+      ...parsed.koalaLive,
     },
   }
 }
@@ -131,14 +150,30 @@ function App() {
   const [lastActionStatus, setLastActionStatus] = useState(
     'Preview mode active. Configure live services in Settings or via environment variables to load real Koala and Polar data.',
   )
+  const [liveDashboard, setLiveDashboard] = useState<DashboardSnapshot>(previewLiveDashboard)
+  const [liveClimate, setLiveClimate] = useState<ClimateSnapshot>(previewClimateSnapshot)
+  const [savedMoments, setSavedMoments] = useState<string[]>(() => {
+    const stored = globalThis.localStorage?.getItem(liveStorageKey)
+    if (!stored) return []
+    try { return JSON.parse(stored) as string[] } catch { return [] }
+  })
+  const [isLiveRefreshing, setIsLiveRefreshing] = useState(false)
+  const [liveStatusText, setLiveStatusText] = useState(
+    'Koala Live is in preview mode until a live Koala endpoint is configured.',
+  )
 
   useEffect(() => {
     globalThis.localStorage?.setItem(storageKey, JSON.stringify(settings))
   }, [settings])
 
+  useEffect(() => {
+    globalThis.localStorage?.setItem(liveStorageKey, JSON.stringify(savedMoments))
+  }, [savedMoments])
+
   const bearClawClient = useMemo(() => createBearClawClient(settings), [settings])
   const koalaClient = useMemo(() => createKoalaAdminClient(settings), [settings])
   const polarClient = useMemo(() => createPolarAdminClient(settings), [settings])
+  const koalaLiveClient = useMemo(() => createKoalaLiveClient(settings), [settings])
 
   const pushAlert = useCallback((title: string, body: string, tone: Tone) => {
     setAlerts((current) => [
@@ -226,6 +261,76 @@ function App() {
       pushAlert('Polar refresh failed', detail, 'critical')
     }
   }, [polarClient, pushAlert])
+
+  const refreshLiveDashboard = useCallback(async (statusMessage?: string) => {
+    setIsLiveRefreshing(true)
+    try {
+      const next = await koalaLiveClient.loadDashboard()
+      setLiveDashboard(next)
+      setLiveStatusText(statusMessage ?? `Koala refreshed ${next.lastUpdatedLabel}.`)
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : 'Unknown error'
+      setLiveStatusText(detail)
+    } finally {
+      setIsLiveRefreshing(false)
+    }
+  }, [koalaLiveClient])
+
+  const refreshLiveClimate = useCallback(async () => {
+    try {
+      const next = await koalaLiveClient.loadClimate()
+      setLiveClimate(next)
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : 'Unknown error'
+      setLiveStatusText(detail)
+    }
+  }, [koalaLiveClient])
+
+  const runLivePackageCheck = useCallback(async () => {
+    setIsLiveRefreshing(true)
+    try {
+      const event = await koalaLiveClient.checkPackage()
+      setLiveDashboard((current) => ({
+        ...current,
+        activity: [event, ...current.activity].slice(0, 8),
+        packageSummary: event.body,
+        headline: event.title,
+      }))
+      setLiveStatusText('Package check completed.')
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : 'Unknown error'
+      setLiveStatusText(detail)
+    } finally {
+      setIsLiveRefreshing(false)
+    }
+  }, [koalaLiveClient])
+
+  const handleLiveDeviceAction = useCallback((deviceId: string, action: DeviceAction) => {
+    setLiveDashboard((current) => ({
+      ...current,
+      devices: current.devices.map((device) => {
+        if (device.id !== deviceId) return device
+        if (action === 'lock') return { ...device, lockState: 'locked' as const, tone: 'healthy' as const }
+        if (action === 'unlock') return { ...device, lockState: 'unlocked' as const, tone: 'warning' as const }
+        if (action === 'open') return { ...device, openState: 'open' as const, tone: 'warning' as const }
+        if (action === 'close') return { ...device, openState: 'closed' as const, tone: 'healthy' as const }
+        return device
+      }),
+    }))
+  }, [])
+
+  const toggleSavedMoment = useCallback((item: ActivityItem) => {
+    setSavedMoments((current) =>
+      current.includes(item.saveKey)
+        ? current.filter((value) => value !== item.saveKey)
+        : [item.saveKey, ...current],
+    )
+  }, [])
+
+  const savedMomentSet = useMemo(() => new Set(savedMoments), [savedMoments])
+
+  useEffect(() => { void refreshLiveDashboard() }, [refreshLiveDashboard])
+  useEffect(() => { void refreshLiveClimate() }, [refreshLiveClimate])
 
   useEffect(() => {
     let cancelled = false
@@ -780,10 +885,249 @@ function App() {
             </Panel>
           </div>
         )
+      case 'live-home':
+        return (
+          <div className="content-grid">
+            <Panel
+              eyebrow="Live Home"
+              title={liveDashboard.headline}
+              subtitle={liveDashboard.subheadline}
+            >
+              <div className="stats-grid three-up">
+                {liveDashboard.stats.map((stat) => (
+                  <StatCard
+                    key={stat.label}
+                    label={stat.label}
+                    value={stat.value}
+                    detail={stat.detail}
+                    tone={stat.tone}
+                  />
+                ))}
+              </div>
+              <div className="action-row">
+                <button className="primary-button" onClick={() => void refreshLiveDashboard('Koala Live refreshed.')} type="button">
+                  {isLiveRefreshing ? 'Refreshing…' : 'Refresh live status'}
+                </button>
+                <button className="secondary-button" onClick={() => void runLivePackageCheck()} type="button">
+                  Check package
+                </button>
+              </div>
+            </Panel>
+
+            <div className="stack">
+              <Panel
+                eyebrow="Locks"
+                title="Lock status"
+                subtitle="Tap to lock or unlock any entry point."
+              >
+                <div className="device-list">
+                  {liveDashboard.devices.filter((d) => d.type === 'lock').map((device) => (
+                    <DeviceRow key={device.id} device={device} onAction={handleLiveDeviceAction} />
+                  ))}
+                </div>
+              </Panel>
+
+              <Panel
+                eyebrow="Entry Points"
+                title="Doors & windows"
+                subtitle="Open and closed state across the home."
+              >
+                <div className="device-list">
+                  {liveDashboard.devices
+                    .filter((d) => d.type === 'door' || d.type === 'window')
+                    .map((device) => (
+                      <DeviceRow key={device.id} device={device} onAction={handleLiveDeviceAction} />
+                    ))}
+                </div>
+              </Panel>
+            </div>
+          </div>
+        )
+
+      case 'live-activity':
+        return (
+          <div className="content-grid">
+            <Panel
+              eyebrow="Timeline"
+              title="Recent activity"
+              subtitle="Incidents, package checks, and front door state updates from Koala."
+            >
+              <ActivityList
+                items={liveDashboard.activity}
+                savedKeys={savedMomentSet}
+                onToggleSave={toggleSavedMoment}
+              />
+            </Panel>
+
+            <Panel
+              eyebrow="Notes"
+              title="What save means today"
+              subtitle="Consumer save behavior exists in the UI even before recording endpoints do."
+            >
+              <ul className="info-list">
+                <li>Saved moments are local to this browser for now.</li>
+                <li>Once Koala recording APIs exist, this can switch to real cloud or device persistence.</li>
+                <li>Live camera playback is intentionally deferred until the media path is ready.</li>
+              </ul>
+            </Panel>
+          </div>
+        )
+
+      case 'live-cameras':
+        return (
+          <div className="content-grid">
+            <Panel
+              eyebrow="Roster"
+              title="Camera views"
+              subtitle="Current consumer-friendly camera availability and status."
+            >
+              <div className="live-camera-grid">
+                {liveDashboard.cameras.map((camera) => (
+                  <CameraCardView key={camera.id} camera={camera} />
+                ))}
+              </div>
+            </Panel>
+
+            <Panel
+              eyebrow="Playback"
+              title="Media path status"
+              subtitle="Koala Live is ready for camera surfaces, but full playback waits on the feed pipeline."
+            >
+              <ul className="info-list">
+                <li>Use this screen as the camera roster and health surface for now.</li>
+                <li>Consumer playback and clip retrieval will slot in here once available.</li>
+                <li>The first deployment target remains Docker on blink, then Jetson later.</li>
+              </ul>
+            </Panel>
+          </div>
+        )
+
+      case 'live-climate': {
+        const indoorLabel = liveClimate.indoor.stale
+          ? 'Stale · last reading may be old'
+          : `via ${liveClimate.indoor.sources.join(', ') || 'no sources connected'}`
+        const outdoorLabel = liveClimate.outdoor.stale
+          ? 'Stale · forecast may be old'
+          : `via ${liveClimate.outdoor.sources.join(', ') || 'no sources connected'}`
+        return (
+          <div className="content-grid">
+            <Panel
+              eyebrow="Indoor Air"
+              title="Inside the home"
+              subtitle={indoorLabel}
+            >
+              <div className="stats-grid three-up">
+                {liveClimate.indoor.readings.map((metric) => (
+                  <StatCard
+                    key={metric.name}
+                    label={metric.display_name}
+                    value={metric.display_value}
+                    detail={metric.domain.replace('_', ' ')}
+                    tone={toneFromQuality(metric.quality)}
+                  />
+                ))}
+              </div>
+              <div className="action-row">
+                <button className="primary-button" onClick={() => void refreshLiveClimate()} type="button">
+                  {isLiveRefreshing ? 'Refreshing…' : 'Refresh climate'}
+                </button>
+              </div>
+            </Panel>
+
+            <Panel
+              eyebrow="Outdoors"
+              title="Outside conditions"
+              subtitle={outdoorLabel}
+            >
+              <div className="stats-grid three-up">
+                {liveClimate.outdoor.current.map((metric) => (
+                  <StatCard
+                    key={metric.name}
+                    label={metric.display_name}
+                    value={metric.display_value}
+                    detail={metric.domain.replace('_', ' ')}
+                    tone={toneFromQuality(metric.quality)}
+                  />
+                ))}
+              </div>
+            </Panel>
+          </div>
+        )
+      }
+
+      case 'live-profile':
+        return (
+          <div className="content-grid">
+            <Panel
+              eyebrow="Household"
+              title="Profile and preferences"
+              subtitle="Consumer-facing writes stay narrow and safe."
+            >
+              <div className="settings-grid">
+                <label className="field">
+                  <span>Viewer name</span>
+                  <input
+                    value={settings.koalaLive.viewerName}
+                    onChange={(event) =>
+                      setSettings((current) => ({
+                        ...current,
+                        koalaLive: { ...current.koalaLive, viewerName: event.target.value },
+                      }))
+                    }
+                    placeholder="Home"
+                  />
+                </label>
+              </div>
+              <ToggleRow
+                label="Critical notifications"
+                detail="Stored locally until consumer profile APIs exist."
+                checked={settings.koalaLive.notificationsEnabled}
+                onChange={(value) =>
+                  setSettings((current) => ({
+                    ...current,
+                    koalaLive: { ...current.koalaLive, notificationsEnabled: value },
+                  }))
+                }
+              />
+              <div className="live-status-row">
+                <StatusPill label={liveDashboard.serviceLabel} tone={liveDashboard.serviceTone} />
+                <p>{liveStatusText}</p>
+              </div>
+            </Panel>
+
+            <Panel
+              eyebrow="Service"
+              title="Connectivity"
+              subtitle="Koala Live uses the Koala and Polar service URLs configured in Settings."
+            >
+              <ActivityTimeline
+                items={[
+                  {
+                    id: 'live-conn-1',
+                    title: 'Koala endpoint',
+                    body: settings.koala.baseUrl || 'Not configured — set via the Settings tab.',
+                    meta: settings.koala.baseUrl ? 'configured' : 'preview',
+                    tone: settings.koala.baseUrl ? 'healthy' : 'neutral',
+                  },
+                  {
+                    id: 'live-conn-2',
+                    title: 'Polar endpoint',
+                    body: settings.polar.baseUrl || 'Not configured — set via the Settings tab.',
+                    meta: settings.polar.baseUrl ? 'configured' : 'preview',
+                    tone: settings.polar.baseUrl ? 'healthy' : 'neutral',
+                  },
+                ]}
+              />
+            </Panel>
+          </div>
+        )
+
       default:
         return null
     }
   }
+
+  const isLiveTab = activeTab.startsWith('live-')
 
   return (
     <div className="app-shell">
@@ -797,41 +1141,71 @@ function App() {
       />
 
       <main className="workspace">
-        <header className="hero-banner">
-          <div>
-            <p className="hero-kicker">BearClaw Admin</p>
-            <h1>Home systems, one administrative surface.</h1>
-            <p className="hero-copy">
-              BearClaw Web is the desktop control plane for the BearClaw runtime,
-              with direct administrative integration paths into Koala and Polar.
-            </p>
-          </div>
-          <div className="hero-status">
-            <div className="service-badges">
-              {configuredServices.map((service) => (
-                <ServiceBadge
-                  key={service.name}
-                  label={service.name}
-                  tone={service.tone}
-                  value={service.label}
-                />
-              ))}
+        {isLiveTab ? (
+          <header className="hero-banner">
+            <div>
+              <p className="hero-kicker">Koala Live</p>
+              <h1>{settings.koalaLive.viewerName || 'Home'} security at a glance.</h1>
+              <p className="hero-copy">
+                Koala Live is the consumer-facing home monitor for camera state, package checks,
+                and recent security activity.
+              </p>
             </div>
-            <p className="hero-status-text">{lastActionStatus}</p>
-          </div>
-        </header>
+            <div className="hero-status">
+              <div className="service-badges">
+                <ServiceBadge
+                  label="Koala"
+                  tone={serviceTones.koala}
+                  value={serviceLabel(canRequest(settings.koala.baseUrl), serviceTones.koala)}
+                />
+                <ServiceBadge
+                  label="Polar"
+                  tone={serviceTones.polar}
+                  value={serviceLabel(canRequest(settings.polar.baseUrl), serviceTones.polar)}
+                />
+              </div>
+              <p className="hero-status-text">{liveStatusText}</p>
+            </div>
+          </header>
+        ) : (
+          <header className="hero-banner">
+            <div>
+              <p className="hero-kicker">BearClaw Admin</p>
+              <h1>Home systems, one administrative surface.</h1>
+              <p className="hero-copy">
+                BearClaw Web is the desktop control plane for the BearClaw runtime,
+                with direct administrative integration paths into Koala and Polar.
+              </p>
+            </div>
+            <div className="hero-status">
+              <div className="service-badges">
+                {configuredServices.map((service) => (
+                  <ServiceBadge
+                    key={service.name}
+                    label={service.name}
+                    tone={service.tone}
+                    value={service.label}
+                  />
+                ))}
+              </div>
+              <p className="hero-status-text">{lastActionStatus}</p>
+            </div>
+          </header>
+        )}
 
-        <section className="summary-strip">
-          {systemSummary.cards.map((card) => (
-            <StatCard
-              key={card.label}
-              label={card.label}
-              value={card.value}
-              detail={card.detail}
-              tone={card.tone}
-            />
-          ))}
-        </section>
+        {!isLiveTab && (
+          <section className="summary-strip">
+            {systemSummary.cards.map((card) => (
+              <StatCard
+                key={card.label}
+                label={card.label}
+                value={card.value}
+                detail={card.detail}
+                tone={card.tone}
+              />
+            ))}
+          </section>
+        )}
 
         {renderMainPanel()}
       </main>

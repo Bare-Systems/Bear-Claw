@@ -5,21 +5,35 @@ version = "1"
 type         = "ssh"
 host         = "blink"
 user         = "admin"
-base         = "/home/admin/baresystems"
-runtime_dir  = "/home/admin/baresystems/runtime/blink-homelab"
+base         = "/home/admin/barelabs"
+runtime_dir  = "/home/admin/barelabs/runtime/blink-homelab"
 binary_rel   = "runtime/blink-homelab/bin/bareclaw"
-binary_path  = "/home/admin/baresystems/runtime/blink-homelab/bin/bareclaw"
+binary_path  = "/home/admin/barelabs/runtime/blink-homelab/bin/bareclaw"
 service_name = "bearclaw"
 
 [services.bearclaw]
 description = "BearClaw daemon on the blink homelab host"
-port        = "6701"
+port        = "8080"
 
 [services.bearclaw.source]
-type     = "local_build"
-workdir  = "."
-command  = "zig build"
-artifact = "zig-out/bin/bareclaw"
+default = "local_docker"
+
+[services.bearclaw.source.builds.local_docker]
+type          = "containerized_local_build"
+image         = "docker:cli"
+mount         = ".:/workspace"
+workdir       = "/workspace"
+command       = "docker buildx build --platform ${TARGET_PLATFORM} --load -f Dockerfile.build -t bareclaw-builder:latest . && docker run --rm --platform ${TARGET_PLATFORM} -v ${BLINK_WORKSPACE_HOST}:/src -w /src/edge bareclaw-builder:latest zig build -Doptimize=ReleaseFast"
+artifact      = "edge/zig-out/bin/bareclaw"
+docker_socket = true
+
+[services.bearclaw.source.builds.local_docker.env]
+TARGET_PLATFORM = "linux/amd64"
+
+[services.bearclaw.source.builds.github]
+type  = "github_release"
+repo  = "Bare-Labs/BearClaw"
+asset = "bareclaw-linux-x86_64"
 
 [services.bearclaw.deploy]
 target            = "homelab"
@@ -30,7 +44,7 @@ rollback_pipeline = ["rollback", "start", "health_check"]
 path = "deploy/blink/provision_remote.sh"
 
 [services.bearclaw.stop]
-command = "env XDG_RUNTIME_DIR=/run/user/$(id -u) systemctl --user stop {{service_name}}.service || true"
+command = "env XDG_RUNTIME_DIR=/run/user/$(id -u) systemctl --user stop {{service_name}}.service || true && pkill -f '{{binary_path}} daemon' || true"
 
 [services.bearclaw.install]
 dest = "runtime/blink-homelab/bin/bareclaw"
