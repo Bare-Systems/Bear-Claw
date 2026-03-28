@@ -95,7 +95,7 @@ zig build test
 
 ```bash
 curl -fsSL -o bareclaw-linux-x86_64.tar.gz \
-  https://github.com/Bare-Labs/BearClaw/releases/latest/download/bareclaw-linux-x86_64.tar.gz
+  https://github.com/Bare-Systems/BearClaw/releases/latest/download/bareclaw-linux-x86_64.tar.gz
 tar -xzf bareclaw-linux-x86_64.tar.gz
 chmod +x bareclaw
 ./bareclaw --help

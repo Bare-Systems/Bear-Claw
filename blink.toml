@@ -32,7 +32,7 @@ TARGET_PLATFORM = "linux/amd64"
 
 [services.bearclaw.source.builds.github]
 type  = "github_release"
-repo  = "Bare-Labs/BearClaw"
+repo  = "Bare-Systems/BearClaw"
 asset = "bareclaw-linux-x86_64"
 
 [services.bearclaw.deploy]
