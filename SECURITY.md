@@ -64,7 +64,7 @@ The `shell` tool checks the command string against a blocklist before execution:
 - `:(){:|:& };:` (fork bomb)
 - Additional destructive patterns
 
-**Note:** The blocklist is a defense-in-depth layer. It is not a full sandbox. For production deployments where untrusted users control agent prompts, consider additional OS-level isolation (see `docs/sandboxing.md`).
+**Note:** The blocklist is a defense-in-depth layer. It is not a full sandbox. For production deployments where untrusted users control agent prompts, consider additional OS-level isolation such as Firejail, Bubblewrap, or Docker.
 
 ### Audit Logging
 
@@ -92,7 +92,7 @@ The log is append-only. BearClaw never reads it back or rotates it automatically
 
 BearClaw's built-in security is workspace-scoped application-level enforcement. It does not provide OS-level process isolation by default.
 
-For higher-assurance deployments, see `docs/sandboxing.md` for options including:
+For higher-assurance deployments, consider options including:
 - **Firejail** — Linux seccomp + filesystem namespacing
 - **Bubblewrap** — Unprivileged sandboxing (used by Flatpak)
 - **Docker** — Full container isolation with `--network none` and read-only rootfs

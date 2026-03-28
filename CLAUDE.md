@@ -156,10 +156,6 @@ src/
 ├── mcp_client.zig    # Generic MCP client — McpSession, McpSessionPool, JSON-RPC stdio
 ├── peripherals.zig   # Hardware peripheral listing stub
 └── migration.zig     # OpenClaw workspace importer
-docs/
-├── audit-logging.md
-├── hardware-peripherals-design.md
-└── network-deployment.md
 ```
 
 ---
@@ -168,7 +164,7 @@ docs/
 
 | Tier | Paths | Required validation |
 |------|-------|---------------------|
-| **Low** | `docs/`, `*.md`, comment-only | None |
+| **Low** | root documentation files, `*.md`, comment-only | None |
 | **Medium** | New tools, providers, config fields | `build()` + `run_tests()` + `run_smoke_tests()` |
 | **High** | `channels.zig`, `security.zig`, `gateway.zig`, `tools.zig` (shell), `config.zig` schema | `build()` + `run_tests()` + `run_smoke_tests()` + `run_integration_test_discord()` |
 

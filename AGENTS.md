@@ -110,7 +110,7 @@ src/
 
 Use these when deciding validation depth.
 
-- **Low risk**: `docs/`, `README.md`, `CHANGELOG.md`, comment-only changes
+- **Low risk**: root documentation files, `README.md`, `CHANGELOG.md`, comment-only changes
 - **Medium risk**: new tools, new providers, channel behavior changes
 - **High risk**: `src/security.zig`, `src/gateway.zig`, `src/tools.zig` (shell execution), path policy changes, config schema changes
 

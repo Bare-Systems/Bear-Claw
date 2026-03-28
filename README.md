@@ -43,7 +43,7 @@ cd ..
 claude mcp add bareclaw mcp/.venv/bin/python3 mcp/server.py
 ```
 
-See [`docs/mcp-development.md`](docs/mcp-development.md) for the full ADHD playbook and [`mcp/README.md`](mcp/README.md) for setup.
+See [`mcp/README.md`](/Users/joecaruso/Projects/BareSystems/BearClaw/mcp/README.md) for the MCP server setup used to develop and exercise BearClaw from agent tooling.
 
 ---
 
