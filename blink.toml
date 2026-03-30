@@ -3,7 +3,7 @@ version = "1"
 
 [targets.homelab]
 type         = "ssh"
-host         = "blink"
+host         = "beelink"
 user         = "admin"
 base         = "/home/admin/barelabs"
 runtime_dir  = "/home/admin/barelabs/runtime/blink-homelab"
@@ -58,5 +58,19 @@ timeout  = 30
 interval = 2
 
 [services.bearclaw.verify]
-suite = "blink/suites/bearclaw_homelab.rb"
-tags  = ["smoke", "health"]
+tags = ["smoke", "health"]
+
+[services.bearclaw.verify.tests.bearclaw-health]
+type          = "http"
+url           = "http://127.0.0.1:{{port}}/health"
+expect_status = 200
+expect_body   = "\"service\":\"bareclaw\""
+tags          = ["smoke", "health"]
+
+[services.bearclaw.verify.tests.bearclaw-webhook]
+type          = "http"
+url           = "http://127.0.0.1:{{port}}/webhook"
+method        = "post"
+expect_status = 200
+expect_body   = "\"received\":true"
+tags          = ["smoke"]
