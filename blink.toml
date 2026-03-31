@@ -23,8 +23,8 @@ type          = "containerized_local_build"
 image         = "docker:cli"
 mount         = ".:/workspace"
 workdir       = "/workspace"
-command       = "docker buildx build --platform ${TARGET_PLATFORM} --load -f Dockerfile.build -t bareclaw-builder:latest . && docker run --rm --platform ${TARGET_PLATFORM} -v ${BLINK_WORKSPACE_HOST}:/src -w /src/edge bareclaw-builder:latest zig build -Doptimize=ReleaseFast"
-artifact      = "edge/zig-out/bin/bareclaw"
+command       = "docker buildx build --platform ${TARGET_PLATFORM} --load -f Dockerfile.build -t bareclaw-builder:latest . && docker run --rm --platform ${TARGET_PLATFORM} -v ${BLINK_WORKSPACE_HOST}:/src -w /src bareclaw-builder:latest zig build -Doptimize=ReleaseFast"
+artifact      = "zig-out/bin/bareclaw"
 docker_socket = true
 
 [services.bearclaw.source.builds.local_docker.env]

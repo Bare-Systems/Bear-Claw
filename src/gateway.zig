@@ -18,7 +18,7 @@ const tools_mod = @import("tools.zig");
 
 const MAX_REQUEST_BYTES: usize = 256 * 1024;
 const MAX_MESSAGE_CHARS: usize = 4000;
-const AGENT_EXECUTION_TIMEOUT_SECONDS: u64 = 30;
+const AGENT_EXECUTION_TIMEOUT_SECONDS: u64 = 120;
 
 pub fn runGateway(port: u16) !void {
     const stdout = std.io.getStdOut().writer();
