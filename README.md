@@ -4,15 +4,11 @@
 
 A fast, self-hostable AI agent runtime written in Zig. BearClaw has zero dependencies beyond the Zig standard library, small binary, runs anywhere from your dev machine to a Raspberry Pi.
 
-> A pragmatic, hardware-savvy bear who guards your workspace — claws out, no compromises.
-
-![python](https://img.shields.io/badge/python-3.11%2B-blue)
+![zig](https://img.shields.io/badge/zig-0.14%2B-orange)
 ![license](https://img.shields.io/badge/license-Apache%202.0-green)
-![protocol](https://img.shields.io/badge/protocol-MCP-purple)
 ![interfaces](https://img.shields.io/badge/interfaces-CLI%20%2B%20Server-0ea5e9)
 
 </div>
----
 
 ## Table of Contents
 
@@ -34,15 +30,12 @@ A fast, self-hostable AI agent runtime written in Zig. BearClaw has zero depende
 
 ## MCP
 
-The Bare Claw repository comes equiped with an MCP server (`mcp/`) which wraps the entire BearClaw CLI and build system as MCP tools so any agent (Claude Desktop, Claude Code, or a BearClaw agent itself) can:
+The Bare Claw repository comes equiped with an MCP server (`mcp/`) which wraps the entire BearClaw CLI and build and test system as MCP tools so any agent (Claude Desktop, Claude Code, or a BearClaw agent itself) can:
 
-- Read and understand the Zig source
-- Edit code and compile immediately
+- Compile immediately
 - Run the full test suite
 - Send prompts to the live agent and inspect side effects
 - Close the loop — all without leaving the conversation
-
-**BearClaw agents can improve BearClaw.** A session running via Telegram or Discord can reason about and propose changes to its own Zig source — the same MCP tools the developer uses are available to any sufficiently capable agent.
 
 Claude can be configured in CLI to user bareclaw like so:
 ```sh

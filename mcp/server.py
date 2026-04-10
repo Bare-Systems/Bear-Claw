@@ -243,56 +243,6 @@ def help() -> str:
 
 
 # ---------------------------------------------------------------------------
-# Source inspection tools
-# ---------------------------------------------------------------------------
-
-
-@mcp.tool()
-def list_source_files() -> str:
-    """List all Zig source files in the src/ directory with their sizes."""
-    src_dir = REPO_ROOT / "src"
-    if not src_dir.exists():
-        return "src/ directory not found."
-    lines = []
-    for f in sorted(src_dir.glob("*.zig")):
-        size = f.stat().st_size
-        lines.append(f"{f.name:30s} {size:>6,} bytes")
-    return "\n".join(lines) if lines else "No .zig files found in src/"
-
-
-@mcp.tool()
-def read_source_file(filename: str) -> str:
-    """Read the contents of a Zig source file from src/.
-
-    Args:
-        filename: The filename within src/ (e.g. "agent.zig", "main.zig").
-    """
-    path = REPO_ROOT / "src" / filename
-    if not path.exists():
-        return f"File not found: src/{filename}"
-    if not path.suffix == ".zig":
-        return "Only .zig files are supported."
-    return path.read_text()
-
-
-@mcp.tool()
-def repo_structure() -> str:
-    """Show the top-level directory structure of the BearClaw repository."""
-    lines = []
-    for item in sorted(REPO_ROOT.iterdir()):
-        if item.name.startswith(".") or item.name in ("zig-out", ".zig-cache"):
-            continue
-        if item.is_dir():
-            lines.append(f"{item.name}/")
-            for child in sorted(item.iterdir()):
-                if not child.name.startswith("."):
-                    lines.append(f"  {child.name}")
-        else:
-            lines.append(item.name)
-    return "\n".join(lines)
-
-
-# ---------------------------------------------------------------------------
 # Config inspection
 # ---------------------------------------------------------------------------
 
