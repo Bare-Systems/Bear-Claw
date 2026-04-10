@@ -23,3 +23,5 @@ ISSUES.md
 suite/
 blink/
 blink
+/blink.toml
+/BLINK.md

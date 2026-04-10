@@ -26,6 +26,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Structured JSON error envelopes containing `request_id`.
 - `X-Correlation-ID` echo support on gateway responses when provided by caller.
 
+### Changed
+
+- Ignored the repository-root `blink.toml` and `BLINK.md` and stopped tracking them so homelab-specific Blink targets and operator notes stay local-only.
+
 ## [0.2.0] - 2026-02-13
 
 ### Added
