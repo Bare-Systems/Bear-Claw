@@ -1,9 +1,17 @@
+<div align="center">
+
 # BearClaw 🐻
 
 A fast, self-hostable AI agent runtime written in Zig. BearClaw has zero dependencies beyond the Zig standard library, small binary, runs anywhere from your dev machine to a Raspberry Pi.
 
-> **Theme**: a pragmatic, hardware-savvy bear who guards your workspace — claws out, no compromises.
+> A pragmatic, hardware-savvy bear who guards your workspace — claws out, no compromises.
 
+![python](https://img.shields.io/badge/python-3.11%2B-blue)
+![license](https://img.shields.io/badge/license-Apache%202.0-green)
+![protocol](https://img.shields.io/badge/protocol-MCP-purple)
+![interfaces](https://img.shields.io/badge/interfaces-CLI%20%2B%20Server-0ea5e9)
+
+</div>
 ---
 
 ## Table of Contents
