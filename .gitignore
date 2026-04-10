@@ -2,6 +2,7 @@
 zig-out/
 *.o
 .env
+.blink/
 
 # Agent Context
 changes/
