@@ -463,12 +463,11 @@ fn postAnthropic(
     });
 
     if (result.status != .ok) {
-        defer response_buf.deinit();
-        return std.fmt.allocPrint(
-            allocator,
-            "Anthropic HTTP {d}: {s}",
-            .{ @intFromEnum(result.status), response_buf.items },
-        );
+        // errdefer at function scope cleans up response_buf on error return.
+        const code: u16 = @intFromEnum(result.status);
+        if (code == 429) return error.ProviderRateLimited;
+        if (code >= 400 and code < 500) return error.ProviderAuthFailed;
+        return error.ProviderUpstreamError;
     }
 
     return response_buf.toOwnedSlice();
@@ -651,12 +650,11 @@ fn postBearer(
     const result = try client.fetch(fetch_opts);
 
     if (result.status != .ok) {
-        defer response_buf.deinit();
-        return std.fmt.allocPrint(
-            allocator,
-            "HTTP {d}: {s}",
-            .{ @intFromEnum(result.status), response_buf.items },
-        );
+        // errdefer at function scope cleans up response_buf on error return.
+        const code: u16 = @intFromEnum(result.status);
+        if (code == 429) return error.ProviderRateLimited;
+        if (code >= 400 and code < 500) return error.ProviderAuthFailed;
+        return error.ProviderUpstreamError;
     }
 
     return response_buf.toOwnedSlice();

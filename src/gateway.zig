@@ -147,15 +147,39 @@ fn handleConnection(allocator: std.mem.Allocator, conn: std.net.Server.Connectio
             error.AgentTimedOut => {
                 const payload = try std.fmt.allocPrint(
                     allocator,
-                    "{{\"code\":\"agent_timeout\",\"message\":\"agent timed out after {d} seconds\",\"request_id\":\"{s}\"}}",
+                    "{{\"code\":\"agent_timeout\",\"message\":\"agent timed out after {d} seconds\",\"retryable\":false,\"request_id\":\"{s}\"}}",
                     .{ AGENT_EXECUTION_TIMEOUT_SECONDS, request_id },
                 );
                 defer allocator.free(payload);
                 try sendJson(conn.stream, "504 Gateway Timeout", payload, request_id);
                 return;
             },
+            error.ProviderUnavailable => {
+                const payload = try std.fmt.allocPrint(allocator, "{{\"code\":\"provider_unavailable\",\"message\":\"upstream provider is unavailable\",\"retryable\":true,\"request_id\":\"{s}\"}}", .{request_id});
+                defer allocator.free(payload);
+                try sendJson(conn.stream, "503 Service Unavailable", payload, request_id);
+                return;
+            },
+            error.ProviderUpstreamError => {
+                const payload = try std.fmt.allocPrint(allocator, "{{\"code\":\"provider_error\",\"message\":\"upstream provider returned an error\",\"retryable\":false,\"request_id\":\"{s}\"}}", .{request_id});
+                defer allocator.free(payload);
+                try sendJson(conn.stream, "502 Bad Gateway", payload, request_id);
+                return;
+            },
+            error.ProviderRateLimited => {
+                const payload = try std.fmt.allocPrint(allocator, "{{\"code\":\"provider_rate_limited\",\"message\":\"upstream provider rate limit exceeded\",\"retryable\":true,\"request_id\":\"{s}\"}}", .{request_id});
+                defer allocator.free(payload);
+                try sendJson(conn.stream, "429 Too Many Requests", payload, request_id);
+                return;
+            },
+            error.ProviderAuthFailed => {
+                const payload = try std.fmt.allocPrint(allocator, "{{\"code\":\"provider_error\",\"message\":\"upstream provider authentication failed\",\"retryable\":false,\"request_id\":\"{s}\"}}", .{request_id});
+                defer allocator.free(payload);
+                try sendJson(conn.stream, "502 Bad Gateway", payload, request_id);
+                return;
+            },
             else => {
-                const payload = try std.fmt.allocPrint(allocator, "{{\"code\":\"internal_error\",\"message\":\"agent execution failed\",\"request_id\":\"{s}\"}}", .{request_id});
+                const payload = try std.fmt.allocPrint(allocator, "{{\"code\":\"internal_error\",\"message\":\"agent execution failed\",\"retryable\":false,\"request_id\":\"{s}\"}}", .{request_id});
                 defer allocator.free(payload);
                 try sendJson(conn.stream, "500 Internal Server Error", payload, request_id);
                 return;
@@ -306,6 +330,17 @@ fn awaitAgentJob(
 
     if (job.error_name) |err_name| {
         std.debug.print("agent worker failed: {s}\n", .{err_name});
+        // Map provider-level error names to typed errors so the gateway can
+        // return the correct HTTP status code and retryable flag.
+        if (std.mem.eql(u8, err_name, "ProviderRateLimited")) return error.ProviderRateLimited;
+        if (std.mem.eql(u8, err_name, "ProviderAuthFailed")) return error.ProviderAuthFailed;
+        if (std.mem.eql(u8, err_name, "ProviderUpstreamError")) return error.ProviderUpstreamError;
+        // Connection-level failures: provider process not running, network down, etc.
+        if (std.mem.eql(u8, err_name, "ConnectionRefused") or
+            std.mem.eql(u8, err_name, "NetworkUnreachable") or
+            std.mem.eql(u8, err_name, "ConnectionTimedOut") or
+            std.mem.eql(u8, err_name, "TemporaryNameServerFailure") or
+            std.mem.eql(u8, err_name, "UnknownHostName")) return error.ProviderUnavailable;
         return error.AgentExecutionFailed;
     }
 

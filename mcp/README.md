@@ -115,6 +115,7 @@ uv run --with mcp-inspector mcp inspect server.py
 | `list_source_files()` | List all `.zig` files in `src/` with sizes |
 | `read_source_file(filename)` | Read a specific file from `src/` (e.g. `"provider.zig"`) |
 | `repo_structure()` | Top-level directory layout |
+| `file_patch(patch_json)` | Apply strict `add` / `update` / `delete` repo edits using a JSON patch payload |
 
 ### Config & Workspace
 

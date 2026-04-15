@@ -151,6 +151,109 @@ def _format(result: dict) -> str:
     return "\n".join(parts) if parts else "(no output)"
 
 
+def _resolve_repo_path(path: str) -> Path:
+    raw = Path(path)
+    resolved = (REPO_ROOT / raw).resolve() if not raw.is_absolute() else raw.resolve()
+    try:
+        resolved.relative_to(REPO_ROOT)
+    except ValueError as exc:
+        raise ValueError(f"path outside repo is not allowed: {path}") from exc
+    return resolved
+
+
+def _count_exact_matches(haystack: str, needle: str) -> int:
+    if not needle:
+        return 0
+    count = 0
+    start = 0
+    while True:
+        idx = haystack.find(needle, start)
+        if idx == -1:
+            return count
+        count += 1
+        start = idx + len(needle)
+
+
+def _apply_file_patch(patch_json: str) -> str:
+    try:
+        payload = json.loads(patch_json)
+    except json.JSONDecodeError as exc:
+        return f"file_patch: invalid JSON: {exc}"
+
+    operations = payload.get("operations")
+    if not isinstance(operations, list) or not operations:
+        return "file_patch: 'operations' must be a non-empty array"
+
+    applied = 0
+    for idx, op in enumerate(operations):
+        if not isinstance(op, dict):
+            return f"file_patch: operation {idx} must be an object"
+
+        op_name = op.get("op")
+        path = op.get("path")
+        if not isinstance(op_name, str) or not op_name:
+            return f"file_patch: operation {idx} missing 'op'"
+        if not isinstance(path, str) or not path:
+            return f"file_patch: operation {idx} missing 'path'"
+        if ".." in Path(path).parts:
+            return f"file_patch: path traversal is not allowed: {path}"
+
+        try:
+            target = _resolve_repo_path(path)
+        except ValueError as exc:
+            return f"file_patch: {exc}"
+
+        if op_name == "add":
+            content = op.get("content")
+            if not isinstance(content, str):
+                return f"file_patch: add operation {idx} missing 'content'"
+            if target.exists():
+                return f"file_patch: add refused for existing file '{path}'"
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(content)
+            applied += 1
+            continue
+
+        if op_name == "update":
+            old = op.get("old")
+            new = op.get("new")
+            if not isinstance(old, str):
+                return f"file_patch: update operation {idx} missing 'old'"
+            if not isinstance(new, str):
+                return f"file_patch: update operation {idx} missing 'new'"
+            if not old:
+                return f"file_patch: update operation {idx} requires non-empty 'old'"
+            if not target.exists():
+                return f"file_patch: update cannot read '{path}': file does not exist"
+
+            current = target.read_text()
+            matches = _count_exact_matches(current, old)
+            if matches == 0:
+                return f"file_patch: stale context for '{path}'"
+            if matches > 1:
+                return f"file_patch: ambiguous context for '{path}' ({matches} matches)"
+            target.write_text(current.replace(old, new, 1))
+            applied += 1
+            continue
+
+        if op_name == "delete":
+            old = op.get("old")
+            if not isinstance(old, str):
+                return f"file_patch: delete operation {idx} missing 'old'"
+            if not target.exists():
+                return f"file_patch: delete cannot read '{path}': file does not exist"
+            current = target.read_text()
+            if current != old:
+                return f"file_patch: stale context for delete '{path}'"
+            target.unlink()
+            applied += 1
+            continue
+
+        return f"file_patch: unsupported op '{op_name}' at index {idx}"
+
+    return f"applied {applied} file_patch operation(s)"
+
+
 mcp = FastMCP("bareclaw")
 
 
@@ -340,6 +443,17 @@ def workspace_contents() -> str:
         if item.is_file():
             lines.append(str(rel))
     return "\n".join(lines) if lines else "Workspace exists but is empty."
+
+
+@mcp.tool()
+def file_patch(patch_json: str) -> str:
+    """Apply add/update/delete file edits inside the BearClaw repo.
+
+    Args:
+        patch_json: JSON object with an `operations` array. Example:
+            {"operations":[{"op":"update","path":"src/tools.zig","old":"before","new":"after"}]}
+    """
+    return _apply_file_patch(patch_json)
 
 
 # ---------------------------------------------------------------------------

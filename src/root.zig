@@ -584,6 +584,7 @@ test "buildCoreTools: all expected tools are present" {
 
     const expected_tools = [_][]const u8{
         "shell",           "file_read",        "file_write",
+        "file_patch",
         "memory_store",    "memory_recall",    "memory_forget",
         "memory_search",   "profile_get",      "profile_set",
         "planner_execute", "memory_list_keys", "memory_delete_prefix",

@@ -350,6 +350,195 @@ fn toolFileWrite(ctx: *ToolContext, args_json: []const u8) !ToolResult {
     return ToolResult.owned(true, msg);
 }
 
+// ── tool: file_patch ──────────────────────────────────────────────────────────
+
+fn countExactMatches(haystack: []const u8, needle: []const u8) usize {
+    if (needle.len == 0) return 0;
+    var count: usize = 0;
+    var cursor: usize = 0;
+    while (std.mem.indexOfPos(u8, haystack, cursor, needle)) |idx| {
+        count += 1;
+        cursor = idx + needle.len;
+    }
+    return count;
+}
+
+fn readWorkspaceFileAlloc(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
+    const file = try std.fs.cwd().openFile(path, .{});
+    defer file.close();
+    return file.readToEndAlloc(allocator, 4 * 1024 * 1024);
+}
+
+fn ensureParentPath(path: []const u8) void {
+    const dir_path = std.fs.path.dirname(path);
+    if (dir_path) |d| {
+        std.fs.cwd().makePath(d) catch {};
+    }
+}
+
+fn fileExists(path: []const u8) !bool {
+    std.fs.cwd().access(path, .{}) catch |err| switch (err) {
+        error.FileNotFound => return false,
+        else => return err,
+    };
+    return true;
+}
+
+fn auditFilePatchMutation(ctx: *ToolContext, op_name: []const u8, path: []const u8) void {
+    const detail = std.fmt.allocPrint(ctx.allocator, "{s}:{s}", .{ op_name, path }) catch return;
+    defer ctx.allocator.free(detail);
+    ctx.policy.auditLog("file_patch", detail) catch {};
+}
+
+fn toolFilePatch(ctx: *ToolContext, args_json: []const u8) !ToolResult {
+    const parsed = std.json.parseFromSlice(std.json.Value, ctx.allocator, args_json, .{}) catch {
+        return ToolResult.literal(false, "invalid JSON in file_patch args");
+    };
+    defer parsed.deinit();
+
+    const ops_value = parsed.value.object.get("operations") orelse {
+        return ToolResult.literal(false, "file_patch: missing 'operations' argument");
+    };
+    const ops = switch (ops_value) {
+        .array => |arr| arr.items,
+        else => return ToolResult.literal(false, "file_patch: 'operations' must be an array"),
+    };
+    if (ops.len == 0) {
+        return ToolResult.literal(false, "file_patch: no operations provided");
+    }
+
+    var applied: usize = 0;
+
+    for (ops, 0..) |op_value, idx| {
+        if (op_value != .object) {
+            const msg = try std.fmt.allocPrint(ctx.allocator, "file_patch: operation {d} must be an object", .{idx});
+            return ToolResult.owned(false, msg);
+        }
+
+        const op_name = getString(op_value, "op") orelse {
+            const msg = try std.fmt.allocPrint(ctx.allocator, "file_patch: operation {d} missing 'op'", .{idx});
+            return ToolResult.owned(false, msg);
+        };
+        const path = getString(op_value, "path") orelse {
+            const msg = try std.fmt.allocPrint(ctx.allocator, "file_patch: operation {d} missing 'path'", .{idx});
+            return ToolResult.owned(false, msg);
+        };
+
+        if (!ctx.policy.allowPath(path)) {
+            const msg = try std.fmt.allocPrint(ctx.allocator, "file_patch: path outside workspace is not allowed: {s}", .{path});
+            return ToolResult.owned(false, msg);
+        }
+
+        if (std.mem.eql(u8, op_name, "add")) {
+            const content = getString(op_value, "content") orelse {
+                const msg = try std.fmt.allocPrint(ctx.allocator, "file_patch: add operation {d} missing 'content'", .{idx});
+                return ToolResult.owned(false, msg);
+            };
+
+            if (try fileExists(path)) {
+                const msg = try std.fmt.allocPrint(ctx.allocator, "file_patch: add refused for existing file '{s}'", .{path});
+                return ToolResult.owned(false, msg);
+            }
+
+            auditFilePatchMutation(ctx, "add", path);
+            ensureParentPath(path);
+
+            var file = std.fs.cwd().createFile(path, .{ .truncate = false, .exclusive = true }) catch |err| {
+                const msg = try std.fmt.allocPrint(ctx.allocator, "file_patch: add failed for '{s}': {}", .{ path, err });
+                return ToolResult.owned(false, msg);
+            };
+            defer file.close();
+            file.writeAll(content) catch |err| {
+                const msg = try std.fmt.allocPrint(ctx.allocator, "file_patch: add write failed for '{s}': {}", .{ path, err });
+                return ToolResult.owned(false, msg);
+            };
+            applied += 1;
+            continue;
+        }
+
+        if (std.mem.eql(u8, op_name, "update")) {
+            const old_text = getString(op_value, "old") orelse {
+                const msg = try std.fmt.allocPrint(ctx.allocator, "file_patch: update operation {d} missing 'old'", .{idx});
+                return ToolResult.owned(false, msg);
+            };
+            const new_text = getString(op_value, "new") orelse {
+                const msg = try std.fmt.allocPrint(ctx.allocator, "file_patch: update operation {d} missing 'new'", .{idx});
+                return ToolResult.owned(false, msg);
+            };
+
+            if (old_text.len == 0) {
+                const msg = try std.fmt.allocPrint(ctx.allocator, "file_patch: update operation {d} requires non-empty 'old' text", .{idx});
+                return ToolResult.owned(false, msg);
+            }
+
+            const current = readWorkspaceFileAlloc(ctx.allocator, path) catch |err| {
+                const msg = try std.fmt.allocPrint(ctx.allocator, "file_patch: update cannot read '{s}': {}", .{ path, err });
+                return ToolResult.owned(false, msg);
+            };
+            defer ctx.allocator.free(current);
+
+            const matches = countExactMatches(current, old_text);
+            if (matches == 0) {
+                const msg = try std.fmt.allocPrint(ctx.allocator, "file_patch: stale context for '{s}'", .{path});
+                return ToolResult.owned(false, msg);
+            }
+            if (matches > 1) {
+                const msg = try std.fmt.allocPrint(ctx.allocator, "file_patch: ambiguous context for '{s}' ({d} matches)", .{ path, matches });
+                return ToolResult.owned(false, msg);
+            }
+
+            const updated = try std.mem.replaceOwned(u8, ctx.allocator, current, old_text, new_text);
+            defer ctx.allocator.free(updated);
+
+            auditFilePatchMutation(ctx, "update", path);
+
+            var file = std.fs.cwd().createFile(path, .{ .truncate = true }) catch |err| {
+                const msg = try std.fmt.allocPrint(ctx.allocator, "file_patch: update cannot open '{s}': {}", .{ path, err });
+                return ToolResult.owned(false, msg);
+            };
+            defer file.close();
+            file.writeAll(updated) catch |err| {
+                const msg = try std.fmt.allocPrint(ctx.allocator, "file_patch: update write failed for '{s}': {}", .{ path, err });
+                return ToolResult.owned(false, msg);
+            };
+            applied += 1;
+            continue;
+        }
+
+        if (std.mem.eql(u8, op_name, "delete")) {
+            const old_text = getString(op_value, "old") orelse {
+                const msg = try std.fmt.allocPrint(ctx.allocator, "file_patch: delete operation {d} missing 'old'", .{idx});
+                return ToolResult.owned(false, msg);
+            };
+
+            const current = readWorkspaceFileAlloc(ctx.allocator, path) catch |err| {
+                const msg = try std.fmt.allocPrint(ctx.allocator, "file_patch: delete cannot read '{s}': {}", .{ path, err });
+                return ToolResult.owned(false, msg);
+            };
+            defer ctx.allocator.free(current);
+
+            if (!std.mem.eql(u8, current, old_text)) {
+                const msg = try std.fmt.allocPrint(ctx.allocator, "file_patch: stale context for delete '{s}'", .{path});
+                return ToolResult.owned(false, msg);
+            }
+
+            auditFilePatchMutation(ctx, "delete", path);
+            std.fs.cwd().deleteFile(path) catch |err| {
+                const msg = try std.fmt.allocPrint(ctx.allocator, "file_patch: delete failed for '{s}': {}", .{ path, err });
+                return ToolResult.owned(false, msg);
+            };
+            applied += 1;
+            continue;
+        }
+
+        const msg = try std.fmt.allocPrint(ctx.allocator, "file_patch: unsupported op '{s}' at index {d}", .{ op_name, idx });
+        return ToolResult.owned(false, msg);
+    }
+
+    const msg = try std.fmt.allocPrint(ctx.allocator, "applied {d} file_patch operation(s)", .{applied});
+    return ToolResult.owned(true, msg);
+}
+
 // ── tool: memory_store ────────────────────────────────────────────────────────
 
 fn toolMemoryStore(ctx: *ToolContext, args_json: []const u8) !ToolResult {
@@ -1179,6 +1368,7 @@ pub fn buildCoreTools(
     try list.append(Tool{ .name = "shell", .description = "Run a shell command. Args: {\"command\": \"<shell string>\"}", .executeFn = toolShell });
     try list.append(Tool{ .name = "file_read", .description = "Read a file from the workspace", .executeFn = toolFileRead });
     try list.append(Tool{ .name = "file_write", .description = "Write content to a file in the workspace", .executeFn = toolFileWrite });
+    try list.append(Tool{ .name = "file_patch", .description = "Apply audited add/update/delete file mutations with strict context matching. Args: {\"operations\":[{\"op\":\"update\",\"path\":\"notes.md\",\"old\":\"before\",\"new\":\"after\"}]}", .executeFn = toolFilePatch });
     try list.append(Tool{ .name = "memory_store", .description = "Store a value in memory by key", .executeFn = toolMemoryStore });
     try list.append(Tool{ .name = "memory_recall", .description = "Recall a stored memory entry by key", .executeFn = toolMemoryRecall });
     try list.append(Tool{ .name = "memory_forget", .description = "Delete a stored memory entry by key", .executeFn = toolMemoryForget });
@@ -1374,6 +1564,218 @@ pub fn freeMcpTools(allocator: std.mem.Allocator, tools: []Tool) void {
         allocator.free(tool.name);
     }
     allocator.free(tools);
+}
+
+const FilePatchTestFixture = struct {
+    allocator: std.mem.Allocator,
+    dir_rel: []u8,
+    cfg: @import("config.zig").Config,
+    policy: security_mod.SecurityPolicy,
+    mem: memory_mod.MemoryBackend,
+    ctx: ToolContext,
+
+    fn init() !FilePatchTestFixture {
+        const allocator = std.testing.allocator;
+        const dir_rel = try std.fmt.allocPrint(allocator, ".zig-cache/file-patch-test-{d}", .{std.time.nanoTimestamp()});
+        errdefer allocator.free(dir_rel);
+        try std.fs.cwd().makePath(dir_rel);
+
+        const cfg = @import("config.zig").Config{
+            .workspace_dir = dir_rel,
+            .config_path = "/tmp/file_patch_test.toml",
+            .default_provider = "echo",
+            .default_model = "test-model",
+            .memory_backend = "markdown",
+            .fallback_providers = "",
+            .api_key = "",
+            .discord_token = "",
+            .discord_webhook = "",
+            .discord_notify_channel = "",
+            .telegram_token = "",
+            .mcp_servers = "",
+            .system_prompt = "",
+            .allowed_paths = "",
+        };
+
+        var policy = security_mod.SecurityPolicy.initWorkspaceOnly(allocator, &cfg);
+        errdefer policy.deinit(allocator);
+
+        var mem = try memory_mod.createMemoryBackend(allocator, &cfg);
+        errdefer mem.deinit();
+
+        return .{
+            .allocator = allocator,
+            .dir_rel = dir_rel,
+            .cfg = cfg,
+            .policy = policy,
+            .mem = mem,
+            .ctx = .{
+                .allocator = allocator,
+                .policy = undefined,
+                .memory = undefined,
+                .cfg = undefined,
+            },
+        };
+    }
+
+    fn finishInit(self: *FilePatchTestFixture) void {
+        self.ctx.policy = &self.policy;
+        self.ctx.memory = &self.mem;
+        self.ctx.cfg = &self.cfg;
+    }
+
+    fn deinit(self: *FilePatchTestFixture) void {
+        self.mem.deinit();
+        self.policy.deinit(self.allocator);
+        std.fs.cwd().deleteTree(self.dir_rel) catch {};
+        self.allocator.free(self.dir_rel);
+    }
+
+    fn allocPath(self: *const FilePatchTestFixture, rel: []const u8) ![]u8 {
+        return std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ self.dir_rel, rel });
+    }
+
+    fn writeFile(self: *const FilePatchTestFixture, rel: []const u8, content: []const u8) !void {
+        const path = try self.allocPath(rel);
+        defer self.allocator.free(path);
+        ensureParentPath(path);
+        try std.fs.cwd().writeFile(.{ .sub_path = path, .data = content });
+    }
+
+    fn readFile(self: *const FilePatchTestFixture, rel: []const u8) ![]u8 {
+        const path = try self.allocPath(rel);
+        defer self.allocator.free(path);
+        return readWorkspaceFileAlloc(self.allocator, path);
+    }
+
+    fn readAudit(self: *const FilePatchTestFixture) ![]u8 {
+        return readWorkspaceFileAlloc(self.allocator, try self.allocPathOwned("audit.log"));
+    }
+
+    fn allocPathOwned(self: *const FilePatchTestFixture, rel: []const u8) ![]u8 {
+        return std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ self.dir_rel, rel });
+    }
+};
+
+fn runFilePatchForTest(ctx: *ToolContext, args_json: []const u8) !ToolResult {
+    return toolFilePatch(ctx, args_json);
+}
+
+test "file_patch rejects stale update context" {
+    var fixture = try FilePatchTestFixture.init();
+    defer fixture.deinit();
+    fixture.finishInit();
+
+    try fixture.writeFile("stale.txt", "hello world");
+    const path = try fixture.allocPath("stale.txt");
+    defer fixture.allocator.free(path);
+
+    const args = try std.fmt.allocPrint(
+        fixture.allocator,
+        "{{\"operations\":[{{\"op\":\"update\",\"path\":\"{s}\",\"old\":\"goodbye\",\"new\":\"hi\"}}]}}",
+        .{path},
+    );
+    defer fixture.allocator.free(args);
+
+    const result = try runFilePatchForTest(&fixture.ctx, args);
+    defer if (result.allocated) fixture.allocator.free(result.output);
+
+    try std.testing.expect(!result.success);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "stale context") != null);
+
+    const current = try fixture.readFile("stale.txt");
+    defer fixture.allocator.free(current);
+    try std.testing.expectEqualStrings("hello world", current);
+}
+
+test "file_patch blocks path traversal" {
+    var fixture = try FilePatchTestFixture.init();
+    defer fixture.deinit();
+    fixture.finishInit();
+
+    const result = try runFilePatchForTest(&fixture.ctx, "{\"operations\":[{\"op\":\"add\",\"path\":\"../escape.txt\",\"content\":\"bad\"}]}");
+    defer if (result.allocated) fixture.allocator.free(result.output);
+
+    try std.testing.expect(!result.success);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "path outside workspace") != null);
+}
+
+test "file_patch supports multi-file add update delete with audit entries" {
+    var fixture = try FilePatchTestFixture.init();
+    defer fixture.deinit();
+    fixture.finishInit();
+
+    try fixture.writeFile("alpha.txt", "alpha");
+    try fixture.writeFile("remove.txt", "gone");
+
+    const alpha_path = try fixture.allocPath("alpha.txt");
+    defer fixture.allocator.free(alpha_path);
+    const beta_path = try fixture.allocPath("beta.txt");
+    defer fixture.allocator.free(beta_path);
+    const remove_path = try fixture.allocPath("remove.txt");
+    defer fixture.allocator.free(remove_path);
+
+    const args = try std.fmt.allocPrint(
+        fixture.allocator,
+        "{{\"operations\":[" ++
+            "{{\"op\":\"update\",\"path\":\"{s}\",\"old\":\"alpha\",\"new\":\"omega\"}}," ++
+            "{{\"op\":\"add\",\"path\":\"{s}\",\"content\":\"beta\"}}," ++
+            "{{\"op\":\"delete\",\"path\":\"{s}\",\"old\":\"gone\"}}" ++
+        "]}}",
+        .{ alpha_path, beta_path, remove_path },
+    );
+    defer fixture.allocator.free(args);
+
+    const result = try runFilePatchForTest(&fixture.ctx, args);
+    defer if (result.allocated) fixture.allocator.free(result.output);
+    try std.testing.expect(result.success);
+
+    const alpha = try fixture.readFile("alpha.txt");
+    defer fixture.allocator.free(alpha);
+    try std.testing.expectEqualStrings("omega", alpha);
+
+    const beta = try fixture.readFile("beta.txt");
+    defer fixture.allocator.free(beta);
+    try std.testing.expectEqualStrings("beta", beta);
+
+    const removed_exists = try fileExists(remove_path);
+    try std.testing.expect(!removed_exists);
+
+    const audit_path = try fixture.allocPathOwned("audit.log");
+    defer fixture.allocator.free(audit_path);
+    const audit = try readWorkspaceFileAlloc(fixture.allocator, audit_path);
+    defer fixture.allocator.free(audit);
+    try std.testing.expect(std.mem.indexOf(u8, audit, "file_patch\tupdate:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, audit, "file_patch\tadd:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, audit, "file_patch\tdelete:") != null);
+}
+
+test "file_patch allows delete then create on the same path" {
+    var fixture = try FilePatchTestFixture.init();
+    defer fixture.deinit();
+    fixture.finishInit();
+
+    try fixture.writeFile("swap.txt", "old");
+    const swap_path = try fixture.allocPath("swap.txt");
+    defer fixture.allocator.free(swap_path);
+
+    const args = try std.fmt.allocPrint(
+        fixture.allocator,
+        "{{\"operations\":[" ++
+            "{{\"op\":\"delete\",\"path\":\"{s}\",\"old\":\"old\"}}," ++
+            "{{\"op\":\"add\",\"path\":\"{s}\",\"content\":\"new\"}}" ++
+        "]}}",
+        .{ swap_path, swap_path },
+    );
+    defer fixture.allocator.free(args);
+
+    const result = try runFilePatchForTest(&fixture.ctx, args);
+    defer if (result.allocated) fixture.allocator.free(result.output);
+    try std.testing.expect(result.success);
+
+    const current = try fixture.readFile("swap.txt");
+    defer fixture.allocator.free(current);
+    try std.testing.expectEqualStrings("new", current);
 }
 
 test "runCommandWithTimeout captures stdout before exit" {

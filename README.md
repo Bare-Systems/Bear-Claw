@@ -54,7 +54,7 @@ See [`mcp/README.md`](/Users/joecaruso/Projects/BareSystems/BearClaw/mcp/README.
 |---|---|
 | **Providers** | Anthropic (Claude), OpenAI, OpenAI-compatible, Ollama, OpenRouter, Echo (offline) |
 | **Routing** | Fallback chain — tries providers in order, returns first success |
-| **Tools** | shell, file_read, file_write, memory_store, memory_recall, memory_forget, memory_search, planner_execute, http_request, git_operations |
+| **Tools** | shell, file_read, file_write, file_patch, memory_store, memory_recall, memory_forget, memory_search, planner_execute, http_request, git_operations |
 | **Agent loop** | Multi-round tool-calling with configurable max rounds (default 8) |
 | **Channels** | CLI (single-turn & interactive loop), Discord (WebSocket Gateway), Telegram (long-polling) |
 | **Memory** | Markdown file-per-key store under `~/.bareclaw/workspace/memory/` |
@@ -257,6 +257,7 @@ The agent can call any of these tools during a conversation. Tools are executed 
 | `shell` | Run a shell command via `/bin/sh -c` | `command` |
 | `file_read` | Read a file from the workspace | `path` |
 | `file_write` | Write content to a file in the workspace | `path`, `content` |
+| `file_patch` | Apply audited `add` / `update` / `delete` edits with strict context matching | `operations` |
 | `memory_store` | Persist a value to the memory backend | `key`, `content` |
 | `memory_recall` | Retrieve a stored value | `key` |
 | `memory_forget` | Delete a stored memory entry | `key` |
@@ -383,7 +384,7 @@ BearClaw enforces a layered security model:
 
 ### Path Policy
 
-`file_read`, `file_write`, and `git_operations` all validate paths before execution:
+`file_read`, `file_write`, `file_patch`, and `git_operations` all validate paths before execution:
 
 - **Directory traversal blocked**: any path containing `..` is rejected
 - **Forbidden system paths**: `/etc/`, `/root/`, `/usr/`, `/proc/`, `/sys/`, `/dev/` are always blocked
@@ -407,7 +408,8 @@ Every tool call is appended to `~/.bareclaw/workspace/audit.log` before executio
 ```
 1700000000	shell	ls -la
 1700000001	file_read	notes.md
-1700000002	memory_store	last_message
+1700000002	file_patch	update:notes.md
+1700000003	memory_store	last_message
 ```
 
 Format: `unix_timestamp TAB tool_name TAB detail`

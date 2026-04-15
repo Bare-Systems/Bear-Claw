@@ -25,6 +25,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `confirmation_reason: null`
 - Structured JSON error envelopes containing `request_id`.
 - `X-Correlation-ID` echo support on gateway responses when provided by caller.
+- Audited `file_patch` editing support across BearClaw and the development MCP server:
+  - Added `file_patch` to the core Zig tool registry with strict `add`, `update`, and `delete` operations.
+  - `update` now rejects stale or ambiguous context, `delete` requires exact file-content match, and every successful mutation is path-validated and logged to `audit.log` before it executes.
+  - Added unit coverage for stale context rejection, path traversal blocking, multi-file patching, and delete-then-create on the same path.
+  - Added matching `file_patch(patch_json)` support to `mcp/server.py` so external MCP clients can apply the same patch shape against the BearClaw repo.
+
+### Fixed
+
+- Provider upstream failures (OOM, 5xx, connection refused) no longer return HTTP 200 with raw error text embedded in the response body. They now return the correct HTTP status code and a structured JSON error envelope with a `retryable` field:
+  - `429` from upstream → `429 Too Many Requests` + `{ "code": "provider_rate_limited", "retryable": true }`
+  - `4xx` from upstream → `502 Bad Gateway` + `{ "code": "provider_error", "retryable": false }`
+  - `5xx` from upstream → `502 Bad Gateway` + `{ "code": "provider_error", "retryable": false }`
+  - Connection refused / network unreachable → `503 Service Unavailable` + `{ "code": "provider_unavailable", "retryable": true }`
+- `agent_timeout` error response now also includes `"retryable": false` for envelope consistency.
 
 ### Changed
 

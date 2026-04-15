@@ -46,7 +46,7 @@ BearClaw implements defense-in-depth security. Every layer applies independently
 
 ### Path Security Policy
 
-`allowPath()` in `security.zig` enforces the following rules on every `file_read`, `file_write`, and `git_operations` call:
+`allowPath()` in `security.zig` enforces the following rules on every `file_read`, `file_write`, `file_patch`, and `git_operations` call:
 
 1. **Directory traversal blocked** — any path segment equal to `..` is rejected immediately.
 2. **Forbidden system path prefixes** — `/etc/`, `/root/`, `/usr/`, `/proc/`, `/sys/`, `/dev/` are always blocked.
@@ -73,7 +73,8 @@ Every tool call is logged to `~/.bareclaw/workspace/audit.log` **before** execut
 ```
 1700000000	shell	ls -la
 1700000001	file_read	workspace/notes.md
-1700000002	memory_store	last_message
+1700000002	file_patch	update:workspace/notes.md
+1700000003	memory_store	last_message
 ```
 
 Format: `unix_timestamp TAB tool_name TAB detail`
