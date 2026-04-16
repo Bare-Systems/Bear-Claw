@@ -31,6 +31,8 @@ pub const ToolResult = struct {
 pub const Tool = struct {
     name: []const u8,
     description: []const u8 = "", // human/LLM-readable description; "" = no description
+    input_schema: ?[]const u8 = null,
+    output_schema: ?[]const u8 = null,
     executeFn: *const fn (ctx: *ToolContext, args_json: []const u8) anyerror!ToolResult,
     /// Optional per-tool metadata (e.g. for MCP proxy tools). Owned by the tool registry.
     user_data: ?*anyopaque = null,
@@ -48,6 +50,7 @@ pub const ToolContext = struct {
     /// Set by agent.zig dispatch loop to point at the current tool's McpProxyMeta
     /// before calling toolMcpProxy. Only valid during an MCP proxy tool call.
     mcp_current_meta: ?*anyopaque = null,
+    run_observer: ?*const planner_mod.RunObserver = null,
 };
 
 // ── helpers ──────────────────────────────────────────────────────────────────
@@ -60,6 +63,310 @@ fn getString(obj: std.json.Value, field: []const u8) ?[]const u8 {
         .string => |s| s,
         else => null,
     };
+}
+
+fn invalidInputMessage(allocator: std.mem.Allocator, detail: []const u8) ![]u8 {
+    return std.fmt.allocPrint(allocator, "invalid_input: {s}", .{detail});
+}
+
+fn jsonValueMatchesType(expected: []const u8, value: std.json.Value) bool {
+    if (std.mem.eql(u8, expected, "object")) return value == .object;
+    if (std.mem.eql(u8, expected, "array")) return value == .array;
+    if (std.mem.eql(u8, expected, "string")) return value == .string;
+    if (std.mem.eql(u8, expected, "boolean")) return value == .bool;
+    if (std.mem.eql(u8, expected, "integer")) return value == .integer;
+    if (std.mem.eql(u8, expected, "number")) return value == .integer or value == .float;
+    if (std.mem.eql(u8, expected, "null")) return value == .null;
+    return false;
+}
+
+fn jsonValueMatchesAllowedTypes(type_value: std.json.Value, value: std.json.Value) bool {
+    return switch (type_value) {
+        .string => |expected| jsonValueMatchesType(expected, value),
+        .array => |arr| blk: {
+            for (arr.items) |item| {
+                if (item != .string) continue;
+                if (jsonValueMatchesType(item.string, value)) break :blk true;
+            }
+            break :blk false;
+        },
+        else => false,
+    };
+}
+
+fn jsonValueMatchesEnumCandidate(candidate: std.json.Value, value: std.json.Value) bool {
+    return switch (candidate) {
+        .string => value == .string and std.mem.eql(u8, candidate.string, value.string),
+        .integer => value == .integer and candidate.integer == value.integer,
+        .float => switch (value) {
+            .float => candidate.float == value.float,
+            .integer => candidate.float == @as(f64, @floatFromInt(value.integer)),
+            else => false,
+        },
+        .bool => value == .bool and candidate.bool == value.bool,
+        .null => value == .null,
+        else => false,
+    };
+}
+
+fn validateSchemaValue(
+    allocator: std.mem.Allocator,
+    schema: std.json.Value,
+    value: std.json.Value,
+    path: []const u8,
+    silent: bool,
+) !?[]u8 {
+    if (schema != .object) {
+        return if (silent)
+            try allocator.dupe(u8, "invalid")
+        else
+            try std.fmt.allocPrint(allocator, "{s} has an invalid tool schema", .{path});
+    }
+
+    if (schema.object.get("anyOf")) |raw_any_of| {
+        if (raw_any_of != .array) {
+            return if (silent)
+                try allocator.dupe(u8, "invalid")
+            else
+                try std.fmt.allocPrint(allocator, "{s} has an invalid anyOf schema", .{path});
+        }
+
+        for (raw_any_of.array.items) |candidate| {
+            const candidate_err = try validateSchemaValue(allocator, candidate, value, path, true);
+            if (candidate_err == null) return null;
+            allocator.free(candidate_err.?);
+        }
+        return if (silent)
+            try allocator.dupe(u8, "invalid")
+        else
+            try std.fmt.allocPrint(allocator, "{s} does not match any allowed input shape", .{path});
+    }
+
+    if (schema.object.get("type")) |type_value| {
+        if (!jsonValueMatchesAllowedTypes(type_value, value)) {
+            return if (silent)
+                try allocator.dupe(u8, "invalid")
+            else
+                try std.fmt.allocPrint(allocator, "{s} has the wrong JSON type", .{path});
+        }
+    }
+
+    if (schema.object.get("enum")) |enum_value| {
+        if (enum_value != .array) {
+            return if (silent)
+                try allocator.dupe(u8, "invalid")
+            else
+                try std.fmt.allocPrint(allocator, "{s} has an invalid enum schema", .{path});
+        }
+
+        var matched = false;
+        for (enum_value.array.items) |candidate| {
+            if (jsonValueMatchesEnumCandidate(candidate, value)) {
+                matched = true;
+                break;
+            }
+        }
+        if (!matched) {
+            return if (silent)
+                try allocator.dupe(u8, "invalid")
+            else
+                try std.fmt.allocPrint(allocator, "{s} must be one of the allowed enum values", .{path});
+        }
+    }
+
+    if (value == .string) {
+        if (schema.object.get("minLength")) |min_len_value| {
+            if (min_len_value != .integer) {
+                return if (silent)
+                    try allocator.dupe(u8, "invalid")
+                else
+                    try std.fmt.allocPrint(allocator, "{s} has an invalid minLength schema", .{path});
+            }
+            if (value.string.len < @as(usize, @intCast(@max(min_len_value.integer, 0)))) {
+                return if (silent)
+                    try allocator.dupe(u8, "invalid")
+                else
+                    try std.fmt.allocPrint(allocator, "{s} must not be empty", .{path});
+            }
+        }
+    }
+
+    switch (value) {
+        .integer, .float => {
+            const numeric_value: f64 = switch (value) {
+                .integer => @floatFromInt(value.integer),
+                .float => value.float,
+                else => unreachable,
+            };
+
+            if (schema.object.get("minimum")) |min_value| {
+                const minimum: f64 = switch (min_value) {
+                    .integer => @floatFromInt(min_value.integer),
+                    .float => min_value.float,
+                    else => return if (silent)
+                        try allocator.dupe(u8, "invalid")
+                    else
+                        try std.fmt.allocPrint(allocator, "{s} has an invalid minimum schema", .{path}),
+                };
+                if (numeric_value < minimum) {
+                    return if (silent)
+                        try allocator.dupe(u8, "invalid")
+                    else
+                        try std.fmt.allocPrint(allocator, "{s} must be >= {d}", .{ path, minimum });
+                }
+            }
+
+            if (schema.object.get("maximum")) |max_value| {
+                const maximum: f64 = switch (max_value) {
+                    .integer => @floatFromInt(max_value.integer),
+                    .float => max_value.float,
+                    else => return if (silent)
+                        try allocator.dupe(u8, "invalid")
+                    else
+                        try std.fmt.allocPrint(allocator, "{s} has an invalid maximum schema", .{path}),
+                };
+                if (numeric_value > maximum) {
+                    return if (silent)
+                        try allocator.dupe(u8, "invalid")
+                    else
+                        try std.fmt.allocPrint(allocator, "{s} must be <= {d}", .{ path, maximum });
+                }
+            }
+        },
+        .array => {
+            if (schema.object.get("minItems")) |min_items_value| {
+                if (min_items_value != .integer) {
+                    return if (silent)
+                        try allocator.dupe(u8, "invalid")
+                    else
+                        try std.fmt.allocPrint(allocator, "{s} has an invalid minItems schema", .{path});
+                }
+                if (value.array.items.len < @as(usize, @intCast(@max(min_items_value.integer, 0)))) {
+                    return if (silent)
+                        try allocator.dupe(u8, "invalid")
+                    else
+                        try std.fmt.allocPrint(allocator, "{s} must contain at least {d} item(s)", .{ path, min_items_value.integer });
+                }
+            }
+
+            if (schema.object.get("items")) |item_schema| {
+                for (value.array.items, 0..) |item, idx| {
+                    const item_path = try std.fmt.allocPrint(allocator, "{s}[{d}]", .{ path, idx });
+                    defer allocator.free(item_path);
+                    if (try validateSchemaValue(allocator, item_schema, item, item_path, silent)) |err_msg| {
+                        return err_msg;
+                    }
+                }
+            }
+        },
+        .object => {
+            var properties_obj: ?std.json.ObjectMap = null;
+            if (schema.object.get("properties")) |properties_value| {
+                if (properties_value != .object) {
+                    return if (silent)
+                        try allocator.dupe(u8, "invalid")
+                    else
+                        try std.fmt.allocPrint(allocator, "{s} has an invalid properties schema", .{path});
+                }
+                properties_obj = properties_value.object;
+            }
+
+            if (schema.object.get("required")) |required_value| {
+                if (required_value != .array) {
+                    return if (silent)
+                        try allocator.dupe(u8, "invalid")
+                    else
+                        try std.fmt.allocPrint(allocator, "{s} has an invalid required schema", .{path});
+                }
+                for (required_value.array.items) |required_item| {
+                    if (required_item != .string) {
+                        return if (silent)
+                            try allocator.dupe(u8, "invalid")
+                        else
+                            try std.fmt.allocPrint(allocator, "{s} has a non-string required field", .{path});
+                    }
+                    if (value.object.get(required_item.string) == null) {
+                        return if (silent)
+                            try allocator.dupe(u8, "invalid")
+                        else
+                            try std.fmt.allocPrint(allocator, "{s}.{s} is required", .{ path, required_item.string });
+                    }
+                }
+            }
+
+            const additional_properties = blk: {
+                if (schema.object.get("additionalProperties")) |raw| {
+                    if (raw != .bool) {
+                        return if (silent)
+                            try allocator.dupe(u8, "invalid")
+                        else
+                            try std.fmt.allocPrint(allocator, "{s} has an invalid additionalProperties schema", .{path});
+                    }
+                    break :blk raw.bool;
+                }
+                break :blk true;
+            };
+
+            if (!additional_properties) {
+                var key_it = value.object.iterator();
+                while (key_it.next()) |entry| {
+                    if (properties_obj == null or properties_obj.?.get(entry.key_ptr.*) == null) {
+                        return if (silent)
+                            try allocator.dupe(u8, "invalid")
+                        else
+                            try std.fmt.allocPrint(allocator, "{s} contains unsupported field '{s}'", .{ path, entry.key_ptr.* });
+                    }
+                }
+            }
+
+            if (properties_obj) |props| {
+                var prop_it = props.iterator();
+                while (prop_it.next()) |entry| {
+                    const child_value = value.object.get(entry.key_ptr.*) orelse continue;
+                    const child_path = try std.fmt.allocPrint(allocator, "{s}.{s}", .{ path, entry.key_ptr.* });
+                    defer allocator.free(child_path);
+                    if (try validateSchemaValue(allocator, entry.value_ptr.*, child_value, child_path, silent)) |err_msg| {
+                        return err_msg;
+                    }
+                }
+            }
+        },
+        else => {},
+    }
+
+    return null;
+}
+
+pub fn validateToolInput(allocator: std.mem.Allocator, tool: Tool, args_json: []const u8) !?[]u8 {
+    const schema_json = tool.input_schema orelse return null;
+
+    var parsed_args = std.json.parseFromSlice(std.json.Value, allocator, args_json, .{}) catch {
+        return try invalidInputMessage(allocator, "arguments must be valid JSON");
+    };
+    defer parsed_args.deinit();
+
+    if (parsed_args.value != .object) {
+        return try invalidInputMessage(allocator, "arguments must be a JSON object");
+    }
+
+    var parsed_schema = std.json.parseFromSlice(std.json.Value, allocator, schema_json, .{}) catch {
+        return try invalidInputMessage(allocator, "tool schema is invalid");
+    };
+    defer parsed_schema.deinit();
+
+    if (try validateSchemaValue(allocator, parsed_schema.value, parsed_args.value, "$", false)) |detail| {
+        defer allocator.free(detail);
+        return try invalidInputMessage(allocator, detail);
+    }
+
+    return null;
+}
+
+pub fn executeTool(ctx: *ToolContext, tool: Tool, args_json: []const u8) !ToolResult {
+    if (try validateToolInput(ctx.allocator, tool, args_json)) |message| {
+        return ToolResult.owned(false, message);
+    }
+    return tool.executeFn(ctx, args_json);
 }
 
 pub const TOOL_TIMEOUT_SECONDS: u64 = 30;
@@ -697,14 +1004,17 @@ fn plannerExecuteStep(ctx_ptr: *anyopaque, tool_name: []const u8, args_json: []c
 
     for (exec_ctx.tool_ctx.all_tools) |tool| {
         if (!std.mem.eql(u8, tool.name, tool_name)) continue;
+        planner_mod.RunObserver.emitToolCall(exec_ctx.tool_ctx.run_observer, tool_name, args_json);
 
         exec_ctx.tool_ctx.mcp_current_meta = tool.user_data;
         defer exec_ctx.tool_ctx.mcp_current_meta = null;
 
-        const result = tool.executeFn(exec_ctx.tool_ctx, args_json) catch |err| {
+        const result = executeTool(exec_ctx.tool_ctx, tool, args_json) catch |err| {
             const msg = try std.fmt.allocPrint(exec_ctx.tool_ctx.allocator, "tool error: {}", .{err});
+            planner_mod.RunObserver.emitToolResult(exec_ctx.tool_ctx.run_observer, tool_name, false, msg);
             return planner_mod.ExecutionResult.owned(false, msg);
         };
+        planner_mod.RunObserver.emitToolResult(exec_ctx.tool_ctx.run_observer, tool_name, result.success, result.output);
         return .{
             .success = result.success,
             .output = result.output,
@@ -749,6 +1059,7 @@ fn toolPlannerExecute(ctx: *ToolContext, args_json: []const u8) !ToolResult {
         descriptors.items,
         &exec_ctx,
         plannerExecuteStep,
+        ctx.run_observer,
         goal,
     );
     return ToolResult.owned(true, summary);
@@ -1357,6 +1668,61 @@ fn toolCronRun(ctx: *ToolContext, _: []const u8) !ToolResult {
 
 // ── registry ──────────────────────────────────────────────────────────────────
 
+const SCHEMA_EMPTY_OBJECT =
+    \\{"type":"object","properties":{},"additionalProperties":false}
+;
+const SCHEMA_SHELL =
+    \\{"type":"object","anyOf":[{"properties":{"command":{"type":"string","minLength":1}},"required":["command"],"additionalProperties":false},{"properties":{"command":{"type":"array","items":{"type":"string"},"minItems":1}},"required":["command"],"additionalProperties":false},{"properties":{"cmd":{"type":"string","minLength":1}},"required":["cmd"],"additionalProperties":false},{"properties":{"cmd":{"type":"array","items":{"type":"string"},"minItems":1}},"required":["cmd"],"additionalProperties":false}]}
+;
+const SCHEMA_FILE_READ =
+    \\{"type":"object","properties":{"path":{"type":"string","minLength":1}},"required":["path"],"additionalProperties":false}
+;
+const SCHEMA_FILE_WRITE =
+    \\{"type":"object","properties":{"path":{"type":"string","minLength":1},"content":{"type":"string"}},"required":["path"],"additionalProperties":false}
+;
+const SCHEMA_FILE_PATCH =
+    \\{"type":"object","properties":{"operations":{"type":"array","minItems":1,"items":{"type":"object","properties":{"op":{"type":"string","minLength":1},"path":{"type":"string","minLength":1},"content":{"type":"string"},"old":{"type":"string"},"new":{"type":"string"}},"required":["op","path"],"additionalProperties":true}}},"required":["operations"],"additionalProperties":false}
+;
+const SCHEMA_MEMORY_STORE =
+    \\{"type":"object","properties":{"key":{"type":"string"},"content":{"type":"string"}},"additionalProperties":false}
+;
+const SCHEMA_MEMORY_KEY_OPTIONAL =
+    \\{"type":"object","properties":{"key":{"type":"string"}},"additionalProperties":false}
+;
+const SCHEMA_MEMORY_SEARCH =
+    \\{"type":"object","properties":{"query":{"type":"string","minLength":1},"limit":{"type":"integer","minimum":1,"maximum":10}},"required":["query"],"additionalProperties":false}
+;
+const SCHEMA_PROFILE_GET =
+    \\{"type":"object","properties":{"key":{"type":"string","minLength":1}},"required":["key"],"additionalProperties":false}
+;
+const SCHEMA_PROFILE_SET =
+    \\{"type":"object","properties":{"key":{"type":"string","minLength":1},"value":{"type":"string"}},"required":["key","value"],"additionalProperties":false}
+;
+const SCHEMA_PLANNER_EXECUTE =
+    \\{"type":"object","anyOf":[{"properties":{"goal":{"type":"string","minLength":1}},"required":["goal"],"additionalProperties":false},{"properties":{"prompt":{"type":"string","minLength":1}},"required":["prompt"],"additionalProperties":false}]}
+;
+const SCHEMA_MEMORY_DELETE_PREFIX =
+    \\{"type":"object","properties":{"prefix":{"type":"string","minLength":1}},"required":["prefix"],"additionalProperties":false}
+;
+const SCHEMA_HTTP_REQUEST =
+    \\{"type":"object","properties":{"url":{"type":"string","minLength":1},"method":{"type":"string","enum":["GET","POST"]},"body":{"type":"string"}},"required":["url"],"additionalProperties":false}
+;
+const SCHEMA_GIT_OPERATIONS =
+    \\{"type":"object","properties":{"op":{"type":"string","enum":["status","log","diff","add","commit","push","pull","clone","init","branch","checkout","fetch","stash"]},"path":{"type":"string","minLength":1},"args":{"type":"string"}},"additionalProperties":false}
+;
+const SCHEMA_AUDIT_LOG_READ =
+    \\{"type":"object","properties":{"n":{"type":"integer","minimum":1}},"additionalProperties":false}
+;
+const SCHEMA_DISCORD_NOTIFY =
+    \\{"type":"object","properties":{"message":{"type":"string","minLength":1}},"required":["message"],"additionalProperties":false}
+;
+const SCHEMA_CRON_ADD_PROMPT =
+    \\{"type":"object","properties":{"schedule":{"type":"string","minLength":1},"prompt":{"type":"string","minLength":1}},"required":["schedule","prompt"],"additionalProperties":false}
+;
+const SCHEMA_CRON_REMOVE =
+    \\{"type":"object","properties":{"id":{"type":"string","minLength":1}},"required":["id"],"additionalProperties":false}
+;
+
 pub fn buildCoreTools(
     allocator: std.mem.Allocator,
     _: *security_mod.SecurityPolicy,
@@ -1365,28 +1731,28 @@ pub fn buildCoreTools(
     var list = std.ArrayList(Tool).init(allocator);
     errdefer list.deinit();
 
-    try list.append(Tool{ .name = "shell", .description = "Run a shell command. Args: {\"command\": \"<shell string>\"}", .executeFn = toolShell });
-    try list.append(Tool{ .name = "file_read", .description = "Read a file from the workspace", .executeFn = toolFileRead });
-    try list.append(Tool{ .name = "file_write", .description = "Write content to a file in the workspace", .executeFn = toolFileWrite });
-    try list.append(Tool{ .name = "file_patch", .description = "Apply audited add/update/delete file mutations with strict context matching. Args: {\"operations\":[{\"op\":\"update\",\"path\":\"notes.md\",\"old\":\"before\",\"new\":\"after\"}]}", .executeFn = toolFilePatch });
-    try list.append(Tool{ .name = "memory_store", .description = "Store a value in memory by key", .executeFn = toolMemoryStore });
-    try list.append(Tool{ .name = "memory_recall", .description = "Recall a stored memory entry by key", .executeFn = toolMemoryRecall });
-    try list.append(Tool{ .name = "memory_forget", .description = "Delete a stored memory entry by key", .executeFn = toolMemoryForget });
-    try list.append(Tool{ .name = "memory_search", .description = "Search memory entries by relevance. Args: {\"query\":\"...\",\"limit\":5}", .executeFn = toolMemorySearch });
-    try list.append(Tool{ .name = "profile_get", .description = "Read a user profile value by key", .executeFn = toolProfileGet });
-    try list.append(Tool{ .name = "profile_set", .description = "Set a user profile value by key", .executeFn = toolProfileSet });
-    try list.append(Tool{ .name = "planner_execute", .description = "Create a multi-step plan, execute tools, and store a reflective summary. Args: {\"goal\":\"...\"}", .executeFn = toolPlannerExecute });
-    try list.append(Tool{ .name = "memory_list_keys", .description = "List all memory entry keys", .executeFn = toolMemoryListKeys });
-    try list.append(Tool{ .name = "memory_delete_prefix", .description = "Delete all memory entries whose key starts with prefix", .executeFn = toolMemoryDeletePrefix });
-    try list.append(Tool{ .name = "http_request", .description = "Make a GET or POST HTTP request", .executeFn = toolHttpRequest });
-    try list.append(Tool{ .name = "git_operations", .description = "Run a git subcommand in the workspace", .executeFn = toolGitOperations });
-    try list.append(Tool{ .name = "agent_status", .description = "Return agent runtime status (provider, model, memory count, loaded tools, cron count)", .executeFn = toolAgentStatus });
-    try list.append(Tool{ .name = "audit_log_read", .description = "Read the last N lines of the audit log", .executeFn = toolAuditLogRead });
-    try list.append(Tool{ .name = "discord_notify", .description = "Send a message to the user on Discord via webhook. Args: {\"message\":\"text\"}.", .executeFn = toolDiscordNotify });
-    try list.append(Tool{ .name = "cron_list", .description = "List all scheduled cron tasks", .executeFn = toolCronList });
-    try list.append(Tool{ .name = "cron_add_prompt", .description = "Schedule a recurring agent-prompt task. The prompt MUST end with 'then use discord_notify to send the result to the user'. Args: {\"schedule\":\"0 9 * * *\",\"prompt\":\"...then use discord_notify to send the result to the user\"}", .executeFn = toolCronAddPrompt });
-    try list.append(Tool{ .name = "cron_remove", .description = "Remove a cron task by ID. Args: {\"id\":\"t1\"}", .executeFn = toolCronRemove });
-    try list.append(Tool{ .name = "cron_run", .description = "Manually trigger all due cron tasks now. Use this to test a scheduled task immediately. Args: {}", .executeFn = toolCronRun });
+    try list.append(Tool{ .name = "shell", .description = "Run a shell command. Args: {\"command\": \"<shell string>\"}", .input_schema = SCHEMA_SHELL, .executeFn = toolShell });
+    try list.append(Tool{ .name = "file_read", .description = "Read a file from the workspace", .input_schema = SCHEMA_FILE_READ, .executeFn = toolFileRead });
+    try list.append(Tool{ .name = "file_write", .description = "Write content to a file in the workspace", .input_schema = SCHEMA_FILE_WRITE, .executeFn = toolFileWrite });
+    try list.append(Tool{ .name = "file_patch", .description = "Apply audited add/update/delete file mutations with strict context matching. Args: {\"operations\":[{\"op\":\"update\",\"path\":\"notes.md\",\"old\":\"before\",\"new\":\"after\"}]}", .input_schema = SCHEMA_FILE_PATCH, .executeFn = toolFilePatch });
+    try list.append(Tool{ .name = "memory_store", .description = "Store a value in memory by key", .input_schema = SCHEMA_MEMORY_STORE, .executeFn = toolMemoryStore });
+    try list.append(Tool{ .name = "memory_recall", .description = "Recall a stored memory entry by key", .input_schema = SCHEMA_MEMORY_KEY_OPTIONAL, .executeFn = toolMemoryRecall });
+    try list.append(Tool{ .name = "memory_forget", .description = "Delete a stored memory entry by key", .input_schema = SCHEMA_MEMORY_KEY_OPTIONAL, .executeFn = toolMemoryForget });
+    try list.append(Tool{ .name = "memory_search", .description = "Search memory entries by relevance. Args: {\"query\":\"...\",\"limit\":5}", .input_schema = SCHEMA_MEMORY_SEARCH, .executeFn = toolMemorySearch });
+    try list.append(Tool{ .name = "profile_get", .description = "Read a user profile value by key", .input_schema = SCHEMA_PROFILE_GET, .executeFn = toolProfileGet });
+    try list.append(Tool{ .name = "profile_set", .description = "Set a user profile value by key", .input_schema = SCHEMA_PROFILE_SET, .executeFn = toolProfileSet });
+    try list.append(Tool{ .name = "planner_execute", .description = "Create a multi-step plan, execute tools, and store a reflective summary. Args: {\"goal\":\"...\"}", .input_schema = SCHEMA_PLANNER_EXECUTE, .executeFn = toolPlannerExecute });
+    try list.append(Tool{ .name = "memory_list_keys", .description = "List all memory entry keys", .input_schema = SCHEMA_EMPTY_OBJECT, .executeFn = toolMemoryListKeys });
+    try list.append(Tool{ .name = "memory_delete_prefix", .description = "Delete all memory entries whose key starts with prefix", .input_schema = SCHEMA_MEMORY_DELETE_PREFIX, .executeFn = toolMemoryDeletePrefix });
+    try list.append(Tool{ .name = "http_request", .description = "Make a GET or POST HTTP request", .input_schema = SCHEMA_HTTP_REQUEST, .executeFn = toolHttpRequest });
+    try list.append(Tool{ .name = "git_operations", .description = "Run a git subcommand in the workspace", .input_schema = SCHEMA_GIT_OPERATIONS, .executeFn = toolGitOperations });
+    try list.append(Tool{ .name = "agent_status", .description = "Return agent runtime status (provider, model, memory count, loaded tools, cron count)", .input_schema = SCHEMA_EMPTY_OBJECT, .executeFn = toolAgentStatus });
+    try list.append(Tool{ .name = "audit_log_read", .description = "Read the last N lines of the audit log", .input_schema = SCHEMA_AUDIT_LOG_READ, .executeFn = toolAuditLogRead });
+    try list.append(Tool{ .name = "discord_notify", .description = "Send a message to the user on Discord via webhook. Args: {\"message\":\"text\"}.", .input_schema = SCHEMA_DISCORD_NOTIFY, .executeFn = toolDiscordNotify });
+    try list.append(Tool{ .name = "cron_list", .description = "List all scheduled cron tasks", .input_schema = SCHEMA_EMPTY_OBJECT, .executeFn = toolCronList });
+    try list.append(Tool{ .name = "cron_add_prompt", .description = "Schedule a recurring agent-prompt task. The prompt MUST end with 'then use discord_notify to send the result to the user'. Args: {\"schedule\":\"0 9 * * *\",\"prompt\":\"...then use discord_notify to send the result to the user\"}", .input_schema = SCHEMA_CRON_ADD_PROMPT, .executeFn = toolCronAddPrompt });
+    try list.append(Tool{ .name = "cron_remove", .description = "Remove a cron task by ID. Args: {\"id\":\"t1\"}", .input_schema = SCHEMA_CRON_REMOVE, .executeFn = toolCronRemove });
+    try list.append(Tool{ .name = "cron_run", .description = "Manually trigger all due cron tasks now. Use this to test a scheduled task immediately. Args: {}", .input_schema = SCHEMA_EMPTY_OBJECT, .executeFn = toolCronRun });
 
     return list.toOwnedSlice();
 }
@@ -1409,12 +1775,17 @@ pub const McpProxyMeta = struct {
     mcp_tool_name: []const u8, // owned
     /// Human-readable description from the MCP server's tools/list response.
     description: []const u8, // owned
+    /// JSON Schema published by the MCP server, when available.
+    input_schema: ?[]const u8 = null, // owned when present
+    output_schema: ?[]const u8 = null, // owned when present
 
     pub fn deinit(self: *McpProxyMeta, allocator: std.mem.Allocator) void {
         for (self.server_argv) |arg| allocator.free(arg);
         allocator.free(self.server_argv);
         allocator.free(self.mcp_tool_name);
         allocator.free(self.description);
+        if (self.input_schema) |value| allocator.free(value);
+        if (self.output_schema) |value| allocator.free(value);
         self.* = undefined;
     }
 };
@@ -1534,11 +1905,15 @@ pub fn buildMcpTools(
                 .server_argv = argv_copy,
                 .mcp_tool_name = try allocator.dupe(u8, mcp_tool.name),
                 .description = desc_copy,
+                .input_schema = if (mcp_tool.input_schema) |value| try allocator.dupe(u8, value) else null,
+                .output_schema = if (mcp_tool.output_schema) |value| try allocator.dupe(u8, value) else null,
             };
 
             try list.append(Tool{
                 .name = tool_name,
                 .description = meta.description, // points into meta — freed via freeMcpTools
+                .input_schema = meta.input_schema,
+                .output_schema = meta.output_schema,
                 .executeFn = toolMcpProxy,
                 .user_data = @ptrCast(meta),
             });
@@ -1721,7 +2096,7 @@ test "file_patch supports multi-file add update delete with audit entries" {
             "{{\"op\":\"update\",\"path\":\"{s}\",\"old\":\"alpha\",\"new\":\"omega\"}}," ++
             "{{\"op\":\"add\",\"path\":\"{s}\",\"content\":\"beta\"}}," ++
             "{{\"op\":\"delete\",\"path\":\"{s}\",\"old\":\"gone\"}}" ++
-        "]}}",
+            "]}}",
         .{ alpha_path, beta_path, remove_path },
     );
     defer fixture.allocator.free(args);
@@ -1764,7 +2139,7 @@ test "file_patch allows delete then create on the same path" {
         "{{\"operations\":[" ++
             "{{\"op\":\"delete\",\"path\":\"{s}\",\"old\":\"old\"}}," ++
             "{{\"op\":\"add\",\"path\":\"{s}\",\"content\":\"new\"}}" ++
-        "]}}",
+            "]}}",
         .{ swap_path, swap_path },
     );
     defer fixture.allocator.free(args);

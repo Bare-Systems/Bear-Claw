@@ -60,7 +60,7 @@ See [`mcp/README.md`](/Users/joecaruso/Projects/BareSystems/BearClaw/mcp/README.
 | **Memory** | Markdown file-per-key store under `~/.bareclaw/workspace/memory/` |
 | **Security** | Path allowlisting, shell command blocklist, append-only audit log |
 | **Cron** | Persistent task scheduler with TSV storage, pause/resume, manual run |
-| **Gateway** | Minimal internal HTTP server (`/health`, `/webhook`, `/v1/chat`) |
+| **Gateway** | Minimal internal HTTP server (`/health`, `/webhook`, `/v1/chat`) with asserted Tardigrade operator identity enforcement |
 | **Daemon** | Gateway + cron runner combined |
 | **Migration** | Import from OpenClaw workspace |
 
@@ -381,6 +381,10 @@ valid and whether the default OpenClaw migration source exists.
 ## Security
 
 BearClaw enforces a layered security model:
+
+The internal HTTP gateway now expects Tardigrade to assert operator identity on
+chat routes with `X-Tardigrade-User-ID` and `X-Tardigrade-Scopes`. Direct
+operator requests that bypass the edge are rejected with `403`.
 
 ### Path Policy
 

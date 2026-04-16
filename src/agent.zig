@@ -4,6 +4,7 @@ const profile_mod = @import("profile.zig");
 const provider_mod = @import("provider.zig");
 const memory_mod = @import("memory.zig");
 const tools_mod = @import("tools.zig");
+const planner_mod = @import("planner.zig");
 const security_mod = @import("security.zig");
 const mcp_mod = @import("mcp_client.zig");
 
@@ -111,8 +112,37 @@ pub fn runAgentWithHistory(
     history: *ConversationHistory,
     out: anytype,
 ) !void {
+    return runAgentWithHistoryObserved(
+        allocator,
+        cfg,
+        provider,
+        memory,
+        tools,
+        policy,
+        mcp_pool,
+        user_message,
+        history,
+        null,
+        out,
+    );
+}
+
+pub fn runAgentWithHistoryObserved(
+    allocator: std.mem.Allocator,
+    cfg: *const config_mod.Config,
+    provider: provider_mod.AnyProvider,
+    memory: *memory_mod.MemoryBackend,
+    tools: []const tools_mod.Tool,
+    policy: *security_mod.SecurityPolicy,
+    mcp_pool: ?*mcp_mod.McpSessionPool,
+    user_message: []const u8,
+    history: *ConversationHistory,
+    observer: ?*const planner_mod.RunObserver,
+    out: anytype,
+) !void {
     // Append the user message to history before calling the provider.
     try history.append(.user, user_message);
+    planner_mod.RunObserver.emitPrompt(observer, user_message);
 
     // Enforce context budget on history (keep it within MAX_CONTEXT_CHARS).
     history.trim(MAX_CONTEXT_CHARS);
@@ -149,6 +179,7 @@ pub fn runAgentWithHistory(
         tools,
         policy,
         mcp_pool,
+        observer,
         effective_user_buf.items,
         &reply_writer,
     );
@@ -173,7 +204,7 @@ pub fn runAgentOnce(
     user_message: []const u8,
 ) !void {
     var stdout = std.io.getStdOut().writer();
-    try runAgentOnceToWriter(allocator, cfg, provider, memory, tools, policy, mcp_pool, user_message, &stdout);
+    try runAgentOnceToWriter(allocator, cfg, provider, memory, tools, policy, mcp_pool, null, user_message, &stdout);
 }
 
 /// Run a single user turn, persist the resulting transcript under a session/*
@@ -189,10 +220,36 @@ pub fn runAgentSingleTurnWithTranscript(
     user_message: []const u8,
     out: anytype,
 ) !void {
+    try runAgentSingleTurnWithTranscriptObserved(
+        allocator,
+        cfg,
+        provider,
+        memory,
+        tools,
+        policy,
+        mcp_pool,
+        user_message,
+        null,
+        out,
+    );
+}
+
+pub fn runAgentSingleTurnWithTranscriptObserved(
+    allocator: std.mem.Allocator,
+    cfg: *const config_mod.Config,
+    provider: provider_mod.AnyProvider,
+    memory: *memory_mod.MemoryBackend,
+    tools: []const tools_mod.Tool,
+    policy: *security_mod.SecurityPolicy,
+    mcp_pool: ?*mcp_mod.McpSessionPool,
+    user_message: []const u8,
+    observer: ?*const planner_mod.RunObserver,
+    out: anytype,
+) !void {
     var history = ConversationHistory.init(allocator);
     defer history.deinit();
 
-    try runAgentWithHistory(
+    try runAgentWithHistoryObserved(
         allocator,
         cfg,
         provider,
@@ -202,6 +259,7 @@ pub fn runAgentSingleTurnWithTranscript(
         mcp_pool,
         user_message,
         &history,
+        observer,
         out,
     );
 
@@ -224,7 +282,7 @@ pub fn runAgentOnceCaptured(
     var buf = std.ArrayList(u8).init(allocator);
     errdefer buf.deinit();
     var writer = buf.writer();
-    try runAgentOnceToWriter(allocator, cfg, provider, memory, tools, policy, mcp_pool, user_message, &writer);
+    try runAgentOnceToWriter(allocator, cfg, provider, memory, tools, policy, mcp_pool, null, user_message, &writer);
     return buf.toOwnedSlice();
 }
 
@@ -335,6 +393,7 @@ fn runAgentOnceToWriter(
     tools: []const tools_mod.Tool,
     policy: *security_mod.SecurityPolicy,
     mcp_pool: ?*mcp_mod.McpSessionPool,
+    observer: ?*const planner_mod.RunObserver,
     user_message: []const u8,
     out: anytype,
 ) !void {
@@ -559,6 +618,7 @@ fn runAgentOnceToWriter(
             0.7,
         );
         defer allocator.free(reply);
+        planner_mod.RunObserver.emitModelOutput(observer, reply);
 
         // Try to dispatch tool calls from this reply.
         const dispatched = try dispatchAllToolCalls(
@@ -569,6 +629,7 @@ fn runAgentOnceToWriter(
             policy,
             memory,
             mcp_pool,
+            observer,
             reply,
             &context,
         );
@@ -666,6 +727,7 @@ fn dispatchAllToolCalls(
     policy: *security_mod.SecurityPolicy,
     memory: *memory_mod.MemoryBackend,
     mcp_pool: ?*mcp_mod.McpSessionPool,
+    observer: ?*const planner_mod.RunObserver,
     response_raw: []const u8,
     context: *std.ArrayList(u8),
 ) !bool {
@@ -714,15 +776,19 @@ fn dispatchAllToolCalls(
                 .provider = provider,
                 .all_tools = tools,
                 .mcp_pool = mcp_pool,
+                .run_observer = observer,
             };
             for (tools) |tool| {
                 if (!std.mem.eql(u8, tool.name, name)) continue;
+                planner_mod.RunObserver.emitToolCall(observer, name, args_json);
                 ctx2.mcp_current_meta = tool.user_data;
-                const result = tool.executeFn(&ctx2, args_json) catch |err| blk: {
+                const result = tools_mod.executeTool(&ctx2, tool, args_json) catch |err| blk: {
                     const msg = try std.fmt.allocPrint(allocator, "tool error: {}", .{err});
+                    planner_mod.RunObserver.emitToolResult(observer, name, false, msg);
                     break :blk tools_mod.ToolResult.owned(false, msg);
                 };
                 defer if (result.allocated) allocator.free(result.output);
+                planner_mod.RunObserver.emitToolResult(observer, name, result.success, result.output);
                 const entry = try std.fmt.allocPrint(
                     allocator,
                     "[{s}] {s}: {s}\n",
@@ -752,6 +818,7 @@ fn dispatchAllToolCalls(
         .provider = provider,
         .all_tools = tools,
         .mcp_pool = mcp_pool,
+        .run_observer = observer,
     };
 
     for (tool_calls.items) |call| {
@@ -835,19 +902,22 @@ fn dispatchAllToolCalls(
         // Find and execute the matching tool.
         for (tools) |tool| {
             if (!std.mem.eql(u8, tool.name, name)) continue;
+            planner_mod.RunObserver.emitToolCall(observer, name, args_json);
 
             // For MCP proxy tools, set the per-tool metadata in context so
             // toolMcpProxy knows which server and tool to call.
             ctx.mcp_current_meta = tool.user_data;
             defer ctx.mcp_current_meta = null;
 
-            const result = tool.executeFn(&ctx, args_json) catch |err| blk: {
+            const result = tools_mod.executeTool(&ctx, tool, args_json) catch |err| blk: {
                 const msg = try std.fmt.allocPrint(allocator, "tool error: {}", .{err});
+                planner_mod.RunObserver.emitToolResult(observer, name, false, msg);
                 break :blk tools_mod.ToolResult.owned(false, msg);
             };
             // Free output only if the tool heap-allocated it.
             // String literals (allocated=false) must NOT be freed.
             defer if (result.allocated) allocator.free(result.output);
+            planner_mod.RunObserver.emitToolResult(observer, name, result.success, result.output);
 
             // Append result to context buffer.
             const status = if (result.success) "ok" else "error";

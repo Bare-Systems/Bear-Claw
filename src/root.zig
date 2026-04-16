@@ -523,6 +523,7 @@ test "planner stores final reflection and returns execution summary" {
         },
         &exec_ctx,
         ExecCtx.exec,
+        null,
         "Remember this result",
     );
     defer std.testing.allocator.free(summary);
@@ -583,14 +584,14 @@ test "buildCoreTools: all expected tools are present" {
     defer tools_mod.freeTools(std.testing.allocator, tool_list);
 
     const expected_tools = [_][]const u8{
-        "shell",           "file_read",        "file_write",
-        "file_patch",
-        "memory_store",    "memory_recall",    "memory_forget",
-        "memory_search",   "profile_get",      "profile_set",
-        "planner_execute", "memory_list_keys", "memory_delete_prefix",
-        "http_request",    "git_operations",   "agent_status",
-        "audit_log_read",  "discord_notify",   "cron_list",
-        "cron_add_prompt", "cron_remove",      "cron_run",
+        "shell",                "file_read",       "file_write",
+        "file_patch",           "memory_store",    "memory_recall",
+        "memory_forget",        "memory_search",   "profile_get",
+        "profile_set",          "planner_execute", "memory_list_keys",
+        "memory_delete_prefix", "http_request",    "git_operations",
+        "agent_status",         "audit_log_read",  "discord_notify",
+        "cron_list",            "cron_add_prompt", "cron_remove",
+        "cron_run",
     };
 
     for (expected_tools) |expected| {
@@ -598,6 +599,7 @@ test "buildCoreTools: all expected tools are present" {
         for (tool_list) |t| {
             if (std.mem.eql(u8, t.name, expected)) {
                 found = true;
+                try std.testing.expect(t.input_schema != null);
                 break;
             }
         }
@@ -607,6 +609,63 @@ test "buildCoreTools: all expected tools are present" {
         }
     }
     try std.testing.expectEqual(expected_tools.len, tool_list.len);
+}
+
+test "executeTool rejects missing required field before tool handler runs" {
+    const tools_mod = @import("tools.zig");
+    const security_mod = @import("security.zig");
+    const memory_mod = @import("memory.zig");
+    const config_mod = @import("config.zig");
+
+    const cfg = config_mod.Config{
+        .workspace_dir = "/tmp",
+        .config_path = "/tmp/test_config.toml",
+        .default_provider = "echo",
+        .default_model = "test",
+        .memory_backend = "markdown",
+        .fallback_providers = "",
+        .api_key = "",
+        .discord_token = "",
+        .discord_webhook = "",
+        .discord_notify_channel = "",
+        .telegram_token = "",
+        .mcp_servers = "",
+        .system_prompt = "",
+        .allowed_paths = "",
+    };
+
+    var policy = security_mod.SecurityPolicy.initWorkspaceOnly(std.testing.allocator, &cfg);
+    defer policy.deinit(std.testing.allocator);
+
+    var mem = try memory_mod.createMemoryBackend(std.testing.allocator, &cfg);
+    defer mem.deinit();
+
+    const tool_list = try tools_mod.buildCoreTools(std.testing.allocator, &policy, &mem);
+    defer tools_mod.freeTools(std.testing.allocator, tool_list);
+
+    var profile_set: ?tools_mod.Tool = null;
+    for (tool_list) |tool| {
+        if (std.mem.eql(u8, tool.name, "profile_set")) {
+            profile_set = tool;
+            break;
+        }
+    }
+    try std.testing.expect(profile_set != null);
+
+    var ctx = tools_mod.ToolContext{
+        .allocator = std.testing.allocator,
+        .policy = &policy,
+        .memory = &mem,
+        .cfg = &cfg,
+        .all_tools = tool_list,
+    };
+
+    const result = try tools_mod.executeTool(&ctx, profile_set.?, "{\"key\":\"favorite_color\"}");
+    defer if (result.allocated) std.testing.allocator.free(result.output);
+
+    try std.testing.expect(!result.success);
+    try std.testing.expect(std.mem.startsWith(u8, result.output, "invalid_input: "));
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "value") != null);
 }
 
 test "agent_status reports provider model and loaded tools" {

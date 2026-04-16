@@ -5,20 +5,223 @@
 ///   POST /webhook  -> 200 {"received":true}
 ///   POST /v1/chat  -> 200 ChatResponse envelope
 ///
-/// Security model for MVP:
+/// Security model:
 /// - Binds to localhost only (127.0.0.1)
-/// - No auth at this layer; Tardigrade edge enforces auth externally.
+/// - Operator routes require asserted identity headers from Tardigrade.
 const std = @import("std");
 const agent_mod = @import("agent.zig");
 const config_mod = @import("config.zig");
 const provider_mod = @import("provider.zig");
 const memory_mod = @import("memory.zig");
+const planner_mod = @import("planner.zig");
 const security_mod = @import("security.zig");
 const tools_mod = @import("tools.zig");
 
 const MAX_REQUEST_BYTES: usize = 256 * 1024;
 const MAX_MESSAGE_CHARS: usize = 4000;
 const AGENT_EXECUTION_TIMEOUT_SECONDS: u64 = 120;
+const MAX_RUN_EVENT_CHARS: usize = 4096;
+const REQUIRED_OPERATOR_SCOPE = "bearclaw.operator";
+
+const AssertedIdentity = struct {
+    user_id: []const u8,
+    device_id: ?[]const u8,
+    scopes: []const u8,
+};
+
+const GatewayRunSink = struct {
+    allocator: std.mem.Allocator,
+    run_id: []u8,
+    user_id: []u8,
+    device_id: ?[]u8,
+    scopes: []u8,
+    artifact_path: []u8,
+    artifact_file: std.fs.File,
+    stream: ?std.net.Stream = null,
+    mutex: std.Thread.Mutex = .{},
+    active: bool = true,
+
+    fn init(
+        allocator: std.mem.Allocator,
+        workspace_dir: []const u8,
+        run_id: []const u8,
+        asserted_identity: AssertedIdentity,
+        stream: ?std.net.Stream,
+    ) !*GatewayRunSink {
+        const runs_dir = try std.fmt.allocPrint(allocator, "{s}/runs", .{workspace_dir});
+        defer allocator.free(runs_dir);
+        try std.fs.cwd().makePath(runs_dir);
+
+        const artifact_path = try std.fmt.allocPrint(allocator, "{s}/{s}.jsonl", .{ runs_dir, run_id });
+        errdefer allocator.free(artifact_path);
+
+        const artifact_file = try std.fs.cwd().createFile(artifact_path, .{ .truncate = true });
+        errdefer artifact_file.close();
+
+        const sink = try allocator.create(GatewayRunSink);
+        sink.* = .{
+            .allocator = allocator,
+            .run_id = try allocator.dupe(u8, run_id),
+            .user_id = try allocator.dupe(u8, asserted_identity.user_id),
+            .device_id = if (asserted_identity.device_id) |value| try allocator.dupe(u8, value) else null,
+            .scopes = try allocator.dupe(u8, asserted_identity.scopes),
+            .artifact_path = artifact_path,
+            .artifact_file = artifact_file,
+            .stream = stream,
+        };
+        return sink;
+    }
+
+    fn deinit(self: *GatewayRunSink) void {
+        self.artifact_file.close();
+        self.allocator.free(self.run_id);
+        self.allocator.free(self.user_id);
+        if (self.device_id) |value| self.allocator.free(value);
+        self.allocator.free(self.scopes);
+        self.allocator.free(self.artifact_path);
+        self.allocator.destroy(self);
+    }
+
+    fn emitPrompt(self: *GatewayRunSink, prompt: []const u8) void {
+        self.emitEvent(.{
+            .event_type = "prompt",
+            .content = prompt,
+        });
+    }
+
+    fn emitToolCall(self: *GatewayRunSink, tool_name: []const u8, args_json: []const u8) void {
+        self.emitEvent(.{
+            .event_type = "tool_call",
+            .tool_name = tool_name,
+            .arguments = args_json,
+        });
+    }
+
+    fn emitToolResult(self: *GatewayRunSink, tool_name: []const u8, success: bool, output: []const u8) void {
+        self.emitEvent(.{
+            .event_type = "tool_result",
+            .tool_name = tool_name,
+            .success = success,
+            .content = output,
+        });
+    }
+
+    fn emitModelOutput(self: *GatewayRunSink, content: []const u8) void {
+        self.emitEvent(.{
+            .event_type = "model_output",
+            .content = content,
+        });
+    }
+
+    fn emitError(self: *GatewayRunSink, code: []const u8, message: []const u8) void {
+        self.emitEvent(.{
+            .event_type = "error",
+            .code = code,
+            .message = message,
+        });
+    }
+
+    fn finishStream(self: *GatewayRunSink) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (!self.active) return;
+
+        if (self.stream) |stream| {
+            const payload = buildMinimalRunEventJson(self.allocator, self.run_id, self.user_id, self.device_id, self.scopes, "done") catch return;
+            defer self.allocator.free(payload);
+            sendSseFrame(stream, "done", payload) catch {};
+        }
+        self.active = false;
+    }
+
+    fn cancelWithError(self: *GatewayRunSink, code: []const u8, message: []const u8) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (!self.active) return;
+        self.writeEventLocked(.{
+            .event_type = "error",
+            .code = code,
+            .message = message,
+        });
+        self.active = false;
+    }
+
+    const EventInput = struct {
+        event_type: []const u8,
+        tool_name: ?[]const u8 = null,
+        arguments: ?[]const u8 = null,
+        success: ?bool = null,
+        content: ?[]const u8 = null,
+        code: ?[]const u8 = null,
+        message: ?[]const u8 = null,
+    };
+
+    fn emitEvent(self: *GatewayRunSink, input: EventInput) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (!self.active) return;
+        self.writeEventLocked(input);
+    }
+
+    fn writeEventLocked(self: *GatewayRunSink, input: EventInput) void {
+        const json = buildRunEventJson(
+            self.allocator,
+            self.run_id,
+            self.user_id,
+            self.device_id,
+            self.scopes,
+            input.event_type,
+            input.tool_name,
+            input.arguments,
+            input.success,
+            input.content,
+            input.code,
+            input.message,
+        ) catch return;
+        defer self.allocator.free(json);
+
+        self.artifact_file.writer().print("{s}\n", .{json}) catch {};
+        if (self.stream) |stream| {
+            sendSseFrame(stream, input.event_type, json) catch {};
+        }
+    }
+};
+
+fn gatewayObserverPrompt(ctx: *anyopaque, prompt: []const u8) void {
+    const sink: *GatewayRunSink = @ptrCast(@alignCast(ctx));
+    sink.emitPrompt(prompt);
+}
+
+fn gatewayObserverToolCall(ctx: *anyopaque, tool_name: []const u8, args_json: []const u8) void {
+    const sink: *GatewayRunSink = @ptrCast(@alignCast(ctx));
+    sink.emitToolCall(tool_name, args_json);
+}
+
+fn gatewayObserverToolResult(ctx: *anyopaque, tool_name: []const u8, success: bool, output: []const u8) void {
+    const sink: *GatewayRunSink = @ptrCast(@alignCast(ctx));
+    sink.emitToolResult(tool_name, success, output);
+}
+
+fn gatewayObserverModelOutput(ctx: *anyopaque, content: []const u8) void {
+    const sink: *GatewayRunSink = @ptrCast(@alignCast(ctx));
+    sink.emitModelOutput(content);
+}
+
+fn gatewayObserverError(ctx: *anyopaque, code: []const u8, message: []const u8) void {
+    const sink: *GatewayRunSink = @ptrCast(@alignCast(ctx));
+    sink.emitError(code, message);
+}
+
+fn buildGatewayRunObserver(sink: *GatewayRunSink) planner_mod.RunObserver {
+    return .{
+        .ctx = sink,
+        .on_prompt = gatewayObserverPrompt,
+        .on_tool_call = gatewayObserverToolCall,
+        .on_tool_result = gatewayObserverToolResult,
+        .on_model_output = gatewayObserverModelOutput,
+        .on_error = gatewayObserverError,
+    };
+}
 
 pub fn runGateway(port: u16) !void {
     const stdout = std.io.getStdOut().writer();
@@ -28,7 +231,7 @@ pub fn runGateway(port: u16) !void {
     defer server.deinit();
 
     try stdout.print("BearClaw gateway listening on http://127.0.0.1:{d}\n", .{port});
-    try stdout.print("Endpoints: GET /health  POST /webhook  POST /v1/chat\n", .{});
+    try stdout.print("Endpoints: GET /health  POST /webhook  POST /v1/chat  POST /v1/chat/stream\n", .{});
 
     while (true) {
         const conn = server.accept() catch |err| {
@@ -119,13 +322,23 @@ fn handleConnection(allocator: std.mem.Allocator, conn: std.net.Server.Connectio
         return;
     }
 
-    if (std.mem.eql(u8, path, "/v1/chat")) {
+    const is_chat = std.mem.eql(u8, path, "/v1/chat");
+    const is_chat_stream = std.mem.eql(u8, path, "/v1/chat/stream");
+
+    if (is_chat or is_chat_stream) {
         if (!std.mem.eql(u8, method, "POST")) {
             const payload = try std.fmt.allocPrint(allocator, "{{\"code\":\"invalid_request\",\"message\":\"method not allowed\",\"request_id\":\"{s}\"}}", .{request_id});
             defer allocator.free(payload);
             try sendJson(conn.stream, "405 Method Not Allowed", payload, request_id);
             return;
         }
+
+        const asserted_identity = parseAssertedIdentity(request[0..headers_end]) orelse {
+            const payload = try std.fmt.allocPrint(allocator, "{{\"code\":\"forbidden\",\"message\":\"asserted tardigrade identity required\",\"request_id\":\"{s}\"}}", .{request_id});
+            defer allocator.free(payload);
+            try sendJson(conn.stream, "403 Forbidden", payload, request_id);
+            return;
+        };
 
         const content_type = parseHeaderValue(request[0..headers_end], "content-type");
         if (!isJsonContentType(content_type)) {
@@ -143,49 +356,90 @@ fn handleConnection(allocator: std.mem.Allocator, conn: std.net.Server.Connectio
         };
         defer allocator.free(message);
 
-        const reply = runAgentForPromptWithTimeout(allocator, message, AGENT_EXECUTION_TIMEOUT_SECONDS) catch |err| switch (err) {
+        var workspace_cfg = try config_mod.loadOrInit(allocator);
+        defer workspace_cfg.deinit(allocator);
+
+        const sink = try GatewayRunSink.init(
+            allocator,
+            workspace_cfg.workspace_dir,
+            request_id,
+            asserted_identity,
+            if (is_chat_stream) conn.stream else null,
+        );
+        var sink_owned_here = true;
+        defer if (sink_owned_here) sink.deinit();
+
+        if (is_chat_stream) {
+            try sendSseHeaders(conn.stream, request_id);
+        }
+
+        const observer = buildGatewayRunObserver(sink);
+        const reply = runAgentForPromptWithTimeout(allocator, message, AGENT_EXECUTION_TIMEOUT_SECONDS, observer, sink) catch |err| switch (err) {
             error.AgentTimedOut => {
-                const payload = try std.fmt.allocPrint(
-                    allocator,
-                    "{{\"code\":\"agent_timeout\",\"message\":\"agent timed out after {d} seconds\",\"retryable\":false,\"request_id\":\"{s}\"}}",
-                    .{ AGENT_EXECUTION_TIMEOUT_SECONDS, request_id },
-                );
-                defer allocator.free(payload);
-                try sendJson(conn.stream, "504 Gateway Timeout", payload, request_id);
+                sink_owned_here = false;
+                if (!is_chat_stream) {
+                    const payload = try std.fmt.allocPrint(
+                        allocator,
+                        "{{\"code\":\"agent_timeout\",\"message\":\"agent timed out after {d} seconds\",\"retryable\":false,\"request_id\":\"{s}\"}}",
+                        .{ AGENT_EXECUTION_TIMEOUT_SECONDS, request_id },
+                    );
+                    defer allocator.free(payload);
+                    try sendJson(conn.stream, "504 Gateway Timeout", payload, request_id);
+                }
                 return;
             },
             error.ProviderUnavailable => {
-                const payload = try std.fmt.allocPrint(allocator, "{{\"code\":\"provider_unavailable\",\"message\":\"upstream provider is unavailable\",\"retryable\":true,\"request_id\":\"{s}\"}}", .{request_id});
-                defer allocator.free(payload);
-                try sendJson(conn.stream, "503 Service Unavailable", payload, request_id);
+                sink.emitError("provider_unavailable", "upstream provider is unavailable");
+                if (!is_chat_stream) {
+                    const payload = try std.fmt.allocPrint(allocator, "{{\"code\":\"provider_unavailable\",\"message\":\"upstream provider is unavailable\",\"retryable\":true,\"request_id\":\"{s}\"}}", .{request_id});
+                    defer allocator.free(payload);
+                    try sendJson(conn.stream, "503 Service Unavailable", payload, request_id);
+                }
                 return;
             },
             error.ProviderUpstreamError => {
-                const payload = try std.fmt.allocPrint(allocator, "{{\"code\":\"provider_error\",\"message\":\"upstream provider returned an error\",\"retryable\":false,\"request_id\":\"{s}\"}}", .{request_id});
-                defer allocator.free(payload);
-                try sendJson(conn.stream, "502 Bad Gateway", payload, request_id);
+                sink.emitError("provider_error", "upstream provider returned an error");
+                if (!is_chat_stream) {
+                    const payload = try std.fmt.allocPrint(allocator, "{{\"code\":\"provider_error\",\"message\":\"upstream provider returned an error\",\"retryable\":false,\"request_id\":\"{s}\"}}", .{request_id});
+                    defer allocator.free(payload);
+                    try sendJson(conn.stream, "502 Bad Gateway", payload, request_id);
+                }
                 return;
             },
             error.ProviderRateLimited => {
-                const payload = try std.fmt.allocPrint(allocator, "{{\"code\":\"provider_rate_limited\",\"message\":\"upstream provider rate limit exceeded\",\"retryable\":true,\"request_id\":\"{s}\"}}", .{request_id});
-                defer allocator.free(payload);
-                try sendJson(conn.stream, "429 Too Many Requests", payload, request_id);
+                sink.emitError("provider_rate_limited", "upstream provider rate limit exceeded");
+                if (!is_chat_stream) {
+                    const payload = try std.fmt.allocPrint(allocator, "{{\"code\":\"provider_rate_limited\",\"message\":\"upstream provider rate limit exceeded\",\"retryable\":true,\"request_id\":\"{s}\"}}", .{request_id});
+                    defer allocator.free(payload);
+                    try sendJson(conn.stream, "429 Too Many Requests", payload, request_id);
+                }
                 return;
             },
             error.ProviderAuthFailed => {
-                const payload = try std.fmt.allocPrint(allocator, "{{\"code\":\"provider_error\",\"message\":\"upstream provider authentication failed\",\"retryable\":false,\"request_id\":\"{s}\"}}", .{request_id});
-                defer allocator.free(payload);
-                try sendJson(conn.stream, "502 Bad Gateway", payload, request_id);
+                sink.emitError("provider_error", "upstream provider authentication failed");
+                if (!is_chat_stream) {
+                    const payload = try std.fmt.allocPrint(allocator, "{{\"code\":\"provider_error\",\"message\":\"upstream provider authentication failed\",\"retryable\":false,\"request_id\":\"{s}\"}}", .{request_id});
+                    defer allocator.free(payload);
+                    try sendJson(conn.stream, "502 Bad Gateway", payload, request_id);
+                }
                 return;
             },
             else => {
-                const payload = try std.fmt.allocPrint(allocator, "{{\"code\":\"internal_error\",\"message\":\"agent execution failed\",\"retryable\":false,\"request_id\":\"{s}\"}}", .{request_id});
-                defer allocator.free(payload);
-                try sendJson(conn.stream, "500 Internal Server Error", payload, request_id);
+                sink.emitError("internal_error", "agent execution failed");
+                if (!is_chat_stream) {
+                    const payload = try std.fmt.allocPrint(allocator, "{{\"code\":\"internal_error\",\"message\":\"agent execution failed\",\"retryable\":false,\"request_id\":\"{s}\"}}", .{request_id});
+                    defer allocator.free(payload);
+                    try sendJson(conn.stream, "500 Internal Server Error", payload, request_id);
+                }
                 return;
             },
         };
         defer allocator.free(reply);
+
+        if (is_chat_stream) {
+            sink.finishStream();
+            return;
+        }
 
         const response_payload = try buildChatResponse(allocator, reply);
         defer allocator.free(response_payload);
@@ -198,7 +452,11 @@ fn handleConnection(allocator: std.mem.Allocator, conn: std.net.Server.Connectio
     try sendJson(conn.stream, "404 Not Found", not_found, request_id);
 }
 
-fn runAgentForPrompt(allocator: std.mem.Allocator, prompt: []const u8) ![]u8 {
+fn runAgentForPrompt(
+    allocator: std.mem.Allocator,
+    prompt: []const u8,
+    observer: ?*const planner_mod.RunObserver,
+) ![]u8 {
     var cfg = try config_mod.loadOrInit(allocator);
     defer cfg.deinit(allocator);
 
@@ -219,7 +477,7 @@ fn runAgentForPrompt(allocator: std.mem.Allocator, prompt: []const u8) ![]u8 {
     errdefer reply_buf.deinit();
     var reply_writer = reply_buf.writer();
 
-    try agent_mod.runAgentSingleTurnWithTranscript(
+    try agent_mod.runAgentSingleTurnWithTranscriptObserved(
         allocator,
         &cfg,
         any_provider,
@@ -228,6 +486,7 @@ fn runAgentForPrompt(allocator: std.mem.Allocator, prompt: []const u8) ![]u8 {
         &policy,
         null,
         prompt,
+        observer,
         &reply_writer,
     );
 
@@ -242,6 +501,8 @@ const AgentRunJob = struct {
     prompt: []u8,
     reply: ?[]u8 = null,
     error_name: ?[]u8 = null,
+    observer: ?planner_mod.RunObserver = null,
+    sink: ?*GatewayRunSink = null,
 };
 
 fn runAgentWorker(job: *AgentRunJob) void {
@@ -251,7 +512,11 @@ fn runAgentWorker(job: *AgentRunJob) void {
 
     defer std.heap.page_allocator.free(job.prompt);
 
-    const reply = runAgentForPrompt(allocator, job.prompt) catch |err| {
+    const reply = runAgentForPrompt(
+        allocator,
+        job.prompt,
+        if (job.observer) |*observer| observer else null,
+    ) catch |err| {
         const err_name = std.heap.page_allocator.dupe(u8, @errorName(err)) catch null;
         finishAgentJob(job, null, err_name);
         return;
@@ -280,6 +545,7 @@ fn finishAgentJob(job: *AgentRunJob, reply: ?[]u8, error_name: ?[]u8) void {
     if (destroy_job) {
         if (job.reply) |owned_reply| std.heap.page_allocator.free(owned_reply);
         if (job.error_name) |owned_error| std.heap.page_allocator.free(owned_error);
+        if (job.sink) |sink| sink.deinit();
         std.heap.page_allocator.destroy(job);
     }
 }
@@ -288,12 +554,16 @@ fn runAgentForPromptWithTimeout(
     allocator: std.mem.Allocator,
     prompt: []const u8,
     timeout_seconds: u64,
+    observer: planner_mod.RunObserver,
+    sink: *GatewayRunSink,
 ) ![]u8 {
     const job = try std.heap.page_allocator.create(AgentRunJob);
     errdefer std.heap.page_allocator.destroy(job);
 
     job.* = .{
         .prompt = try std.heap.page_allocator.dupe(u8, prompt),
+        .observer = observer,
+        .sink = sink,
     };
     errdefer std.heap.page_allocator.free(job.prompt);
 
@@ -312,6 +582,9 @@ fn awaitAgentJob(
         job.cond.timedWait(&job.mutex, timeout_seconds * std.time.ns_per_s) catch |err| switch (err) {
             error.Timeout => {
                 job.caller_timed_out = true;
+                if (job.sink) |sink| {
+                    sink.cancelWithError("agent_timeout", "agent timed out");
+                }
                 job.mutex.unlock();
                 thread.detach();
                 return error.AgentTimedOut;
@@ -361,6 +634,111 @@ fn buildChatResponse(allocator: std.mem.Allocator, reply: []const u8) ![]u8 {
         "{{\"message\":{{\"id\":\"{s}\",\"role\":\"assistant\",\"content\":{s},\"timestamp\":{d}}},\"requires_confirmation\":false,\"confirmation_reason\":null}}",
         .{ id, std.json.fmt(reply, .{}), apple_ref_ts },
     );
+}
+
+fn isBearerSecretByte(c: u8) bool {
+    return !std.ascii.isWhitespace(c) and c != '"' and c != '\'' and c != ',' and c != '}' and c != ']';
+}
+
+fn redactBearerTokens(allocator: std.mem.Allocator, input: []const u8) ![]u8 {
+    var out = std.ArrayList(u8).init(allocator);
+    errdefer out.deinit();
+
+    var i: usize = 0;
+    while (i < input.len) {
+        if (i + 7 <= input.len and std.ascii.eqlIgnoreCase(input[i .. i + 7], "Bearer ")) {
+            try out.appendSlice(input[i .. i + 7]);
+            var j = i + 7;
+            while (j < input.len and isBearerSecretByte(input[j])) : (j += 1) {}
+            if (j > i + 7) {
+                try out.appendSlice("[REDACTED]");
+                i = j;
+                continue;
+            }
+        }
+
+        try out.append(input[i]);
+        i += 1;
+    }
+
+    return out.toOwnedSlice();
+}
+
+fn sanitizeRunEventText(allocator: std.mem.Allocator, input: []const u8) ![]u8 {
+    const redacted = try redactBearerTokens(allocator, input);
+    if (redacted.len <= MAX_RUN_EVENT_CHARS) return redacted;
+
+    defer allocator.free(redacted);
+    const omitted = redacted.len - MAX_RUN_EVENT_CHARS;
+    return std.fmt.allocPrint(
+        allocator,
+        "{s}... [truncated {d} chars]",
+        .{ redacted[0..MAX_RUN_EVENT_CHARS], omitted },
+    );
+}
+
+fn buildMinimalRunEventJson(
+    allocator: std.mem.Allocator,
+    run_id: []const u8,
+    user_id: []const u8,
+    device_id: ?[]const u8,
+    scopes: []const u8,
+    event_type: []const u8,
+) ![]u8 {
+    var buf = std.ArrayList(u8).init(allocator);
+    errdefer buf.deinit();
+    try buf.writer().print(
+        "{{\"type\":{s},\"run_id\":{s},\"user_id\":{s},\"ts\":{d}",
+        .{ std.json.fmt(event_type, .{}), std.json.fmt(run_id, .{}), std.json.fmt(user_id, .{}), std.time.timestamp() },
+    );
+    if (device_id) |value| try buf.writer().print(",\"device_id\":{s}", .{std.json.fmt(value, .{})});
+    if (scopes.len > 0) try buf.writer().print(",\"scopes\":{s}", .{std.json.fmt(scopes, .{})});
+    try buf.append('}');
+    return buf.toOwnedSlice();
+}
+
+fn buildRunEventJson(
+    allocator: std.mem.Allocator,
+    run_id: []const u8,
+    user_id: []const u8,
+    device_id: ?[]const u8,
+    scopes: []const u8,
+    event_type: []const u8,
+    tool_name: ?[]const u8,
+    arguments: ?[]const u8,
+    success: ?bool,
+    content: ?[]const u8,
+    code: ?[]const u8,
+    message: ?[]const u8,
+) ![]u8 {
+    const safe_tool = if (tool_name) |value| try sanitizeRunEventText(allocator, value) else null;
+    defer if (safe_tool) |value| allocator.free(value);
+    const safe_args = if (arguments) |value| try sanitizeRunEventText(allocator, value) else null;
+    defer if (safe_args) |value| allocator.free(value);
+    const safe_content = if (content) |value| try sanitizeRunEventText(allocator, value) else null;
+    defer if (safe_content) |value| allocator.free(value);
+    const safe_code = if (code) |value| try sanitizeRunEventText(allocator, value) else null;
+    defer if (safe_code) |value| allocator.free(value);
+    const safe_message = if (message) |value| try sanitizeRunEventText(allocator, value) else null;
+    defer if (safe_message) |value| allocator.free(value);
+
+    var buf = std.ArrayList(u8).init(allocator);
+    errdefer buf.deinit();
+
+    try buf.writer().print(
+        "{{\"type\":{s},\"run_id\":{s},\"user_id\":{s},\"ts\":{d}",
+        .{ std.json.fmt(event_type, .{}), std.json.fmt(run_id, .{}), std.json.fmt(user_id, .{}), std.time.timestamp() },
+    );
+    if (device_id) |value| try buf.writer().print(",\"device_id\":{s}", .{std.json.fmt(value, .{})});
+    if (scopes.len > 0) try buf.writer().print(",\"scopes\":{s}", .{std.json.fmt(scopes, .{})});
+    if (safe_tool) |value| try buf.writer().print(",\"tool\":{s}", .{std.json.fmt(value, .{})});
+    if (safe_args) |value| try buf.writer().print(",\"arguments\":{s}", .{std.json.fmt(value, .{})});
+    if (success) |value| try buf.writer().print(",\"success\":{}", .{value});
+    if (safe_content) |value| try buf.writer().print(",\"content\":{s}", .{std.json.fmt(value, .{})});
+    if (safe_code) |value| try buf.writer().print(",\"code\":{s}", .{std.json.fmt(value, .{})});
+    if (safe_message) |value| try buf.writer().print(",\"message\":{s}", .{std.json.fmt(value, .{})});
+    try buf.append('}');
+    return buf.toOwnedSlice();
 }
 
 fn parseChatMessage(allocator: std.mem.Allocator, body: []const u8) ![]u8 {
@@ -435,9 +813,61 @@ fn parseHeaderValue(headers: []const u8, name: []const u8) ?[]const u8 {
     return null;
 }
 
+fn parseAssertedIdentity(headers: []const u8) ?AssertedIdentity {
+    const user_id = parseHeaderValue(headers, "x-tardigrade-user-id") orelse return null;
+    const trimmed_user_id = std.mem.trim(u8, user_id, " \t");
+    if (trimmed_user_id.len == 0) return null;
+
+    const scopes = parseHeaderValue(headers, "x-tardigrade-scopes") orelse return null;
+    const trimmed_scopes = std.mem.trim(u8, scopes, " \t");
+    if (!scopesContain(trimmed_scopes, REQUIRED_OPERATOR_SCOPE)) return null;
+
+    const device_id = if (parseHeaderValue(headers, "x-tardigrade-device-id")) |value|
+        std.mem.trim(u8, value, " \t")
+    else
+        null;
+
+    return .{
+        .user_id = trimmed_user_id,
+        .device_id = if (device_id) |value| if (value.len > 0) value else null else null,
+        .scopes = trimmed_scopes,
+    };
+}
+
+fn scopesContain(scopes: []const u8, required: []const u8) bool {
+    var it = std.mem.tokenizeAny(u8, scopes, " ,");
+    while (it.next()) |scope| {
+        if (std.mem.eql(u8, scope, required)) return true;
+    }
+    return false;
+}
+
 fn parseContentLength(headers: []const u8) ?usize {
     const value = parseHeaderValue(headers, "content-length") orelse return null;
     return std.fmt.parseInt(usize, value, 10) catch null;
+}
+
+fn sendSseHeaders(stream: std.net.Stream, run_id: []const u8) !void {
+    const w = stream.writer();
+    try w.print(
+        "HTTP/1.1 200 OK\r\n" ++
+            "Content-Type: text/event-stream\r\n" ++
+            "Cache-Control: no-cache\r\n" ++
+            "Connection: close\r\n" ++
+            "X-Correlation-ID: {s}\r\n" ++
+            "X-Run-ID: {s}\r\n" ++
+            "\r\n",
+        .{ run_id, run_id },
+    );
+}
+
+fn appendSseFrame(writer: anytype, event_type: []const u8, json_payload: []const u8) !void {
+    try writer.print("event: {s}\n", .{event_type});
+    try writer.print("data: {s}\n\n", .{json_payload});
+}
+
+fn sendSseFrame(stream: std.net.Stream, event_type: []const u8, json_payload: []const u8) !void {
+    try appendSseFrame(stream.writer(), event_type, json_payload);
 }
 
 fn sendJson(stream: std.net.Stream, status: []const u8, body: []const u8, request_id: ?[]const u8) !void {
@@ -447,11 +877,12 @@ fn sendJson(stream: std.net.Stream, status: []const u8, body: []const u8, reques
             "HTTP/1.1 {s}\r\n" ++
                 "Content-Type: application/json\r\n" ++
                 "X-Correlation-ID: {s}\r\n" ++
+                "X-Run-ID: {s}\r\n" ++
                 "Content-Length: {d}\r\n" ++
                 "Connection: close\r\n" ++
                 "\r\n" ++
                 "{s}",
-            .{ status, rid, body.len, body },
+            .{ status, rid, rid, body.len, body },
         );
         return;
     }
@@ -526,6 +957,22 @@ test "buildChatResponse returns envelope" {
     try std.testing.expect(std.mem.indexOf(u8, payload, "confirmation_reason") != null);
 }
 
+test "buildChatResponse keeps the non-streaming assistant envelope" {
+    const allocator = std.testing.allocator;
+    const payload = try buildChatResponse(allocator, "still ok");
+    defer allocator.free(payload);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, payload, .{});
+    defer parsed.deinit();
+
+    const obj = parsed.value.object;
+    const message = obj.get("message") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("assistant", message.object.get("role").?.string);
+    try std.testing.expectEqualStrings("still ok", message.object.get("content").?.string);
+    try std.testing.expectEqual(false, obj.get("requires_confirmation").?.bool);
+    try std.testing.expectEqual(.null, obj.get("confirmation_reason").?);
+}
+
 fn testFastJobWorker(job: *AgentRunJob) void {
     std.heap.page_allocator.free(job.prompt);
     const reply = std.heap.page_allocator.dupe(u8, "ok") catch unreachable;
@@ -566,4 +1013,185 @@ test "awaitAgentJob reports timeout for slow worker" {
 
     var thread = try std.Thread.spawn(.{}, testSlowJobWorker, .{job});
     try std.testing.expectError(error.AgentTimedOut, awaitAgentJob(allocator, job, &thread, 0));
+}
+
+fn createTestWorkspaceDir(allocator: std.mem.Allocator, tmp: *std.testing.TmpDir) ![]u8 {
+    const workspace_dir = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/workspace", .{tmp.sub_path});
+    errdefer allocator.free(workspace_dir);
+    try std.fs.cwd().makePath(workspace_dir);
+    return workspace_dir;
+}
+
+fn testAssertedIdentity() AssertedIdentity {
+    return .{
+        .user_id = "user-42",
+        .device_id = "bearclaw-web",
+        .scopes = "bearclaw.operator",
+    };
+}
+
+fn findFreeLocalPort() !u16 {
+    const address = try std.net.Address.parseIp4("127.0.0.1", 0);
+    var listener = try address.listen(.{ .reuse_address = true });
+    defer listener.deinit();
+    return listener.listen_address.getPort();
+}
+
+fn wakeGatewayListener(port: u16) void {
+    const address = std.net.Address.parseIp4("127.0.0.1", port) catch return;
+    var stream = std.net.tcpConnectToAddress(address) catch return;
+    defer stream.close();
+    stream.writeAll("GET /health HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n") catch {};
+}
+
+fn sendRawGatewayRequest(allocator: std.mem.Allocator, port: u16, request: []const u8) ![]u8 {
+    const address = try std.net.Address.parseIp4("127.0.0.1", port);
+    var stream = try std.net.tcpConnectToAddress(address);
+    defer stream.close();
+    try stream.writeAll(request);
+
+    var response = std.ArrayList(u8).init(allocator);
+    errdefer response.deinit();
+    var buf: [4096]u8 = undefined;
+    while (true) {
+        const n = try stream.read(&buf);
+        if (n == 0) break;
+        try response.appendSlice(buf[0..n]);
+    }
+    return response.toOwnedSlice();
+}
+
+test "appendSseFrame matches the gateway stream fixture" {
+    const allocator = std.testing.allocator;
+    var buf = std.ArrayList(u8).init(allocator);
+    defer buf.deinit();
+
+    try appendSseFrame(buf.writer(), "model_output", "{\"type\":\"model_output\",\"run_id\":\"run-123\",\"content\":\"ok\"}");
+
+    try std.testing.expectEqualStrings(
+        "event: model_output\n" ++
+            "data: {\"type\":\"model_output\",\"run_id\":\"run-123\",\"content\":\"ok\"}\n\n",
+        buf.items,
+    );
+}
+
+test "parseAssertedIdentity requires tardigrade operator assertions" {
+    const headers =
+        "POST /v1/chat HTTP/1.1\r\n" ++
+        "X-Tardigrade-User-ID: user-42\r\n" ++
+        "X-Tardigrade-Device-ID: bearclaw-web\r\n" ++
+        "X-Tardigrade-Scopes: bearclaw.operator bearclaw.admin\r\n\r\n";
+    const asserted = parseAssertedIdentity(headers) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("user-42", asserted.user_id);
+    try std.testing.expectEqualStrings("bearclaw-web", asserted.device_id.?);
+    try std.testing.expectEqualStrings("bearclaw.operator bearclaw.admin", asserted.scopes);
+}
+
+test "parseAssertedIdentity rejects missing operator scope" {
+    const headers =
+        "POST /v1/chat HTTP/1.1\r\n" ++
+        "X-Tardigrade-User-ID: user-42\r\n" ++
+        "X-Tardigrade-Scopes: bearclaw.viewer\r\n\r\n";
+    try std.testing.expect(parseAssertedIdentity(headers) == null);
+}
+
+test "chat requests without tardigrade assertions return 403" {
+    const allocator = std.testing.allocator;
+    const port = try findFreeLocalPort();
+    var shutdown = std.atomic.Value(bool).init(false);
+    var thread = try std.Thread.spawn(.{}, runGatewayWithShutdown, .{ port, &shutdown });
+    defer {
+        shutdown.store(true, .release);
+        wakeGatewayListener(port);
+        thread.join();
+    }
+
+    std.time.sleep(50 * std.time.ns_per_ms);
+
+    const raw_response = try sendRawGatewayRequest(
+        allocator,
+        port,
+        "POST /v1/chat HTTP/1.1\r\n" ++
+            "Host: 127.0.0.1\r\n" ++
+            "Content-Type: application/json\r\n" ++
+            "Content-Length: 19\r\n" ++
+            "Connection: close\r\n\r\n" ++
+            "{\"message\":\"hi\"}",
+    );
+    defer allocator.free(raw_response);
+
+    try std.testing.expect(std.mem.indexOf(u8, raw_response, "403 Forbidden") != null);
+    try std.testing.expect(std.mem.indexOf(u8, raw_response, "asserted tardigrade identity required") != null);
+}
+
+test "sanitizeRunEventText redacts bearer tokens and truncates long output" {
+    const allocator = std.testing.allocator;
+    var raw = std.ArrayList(u8).init(allocator);
+    defer raw.deinit();
+
+    try raw.appendSlice("Authorization: Bearer super-secret-token ");
+    try raw.appendNTimes('a', MAX_RUN_EVENT_CHARS + 64);
+
+    const sanitized = try sanitizeRunEventText(allocator, raw.items);
+    defer allocator.free(sanitized);
+
+    try std.testing.expect(std.mem.indexOf(u8, sanitized, "super-secret-token") == null);
+    try std.testing.expect(std.mem.indexOf(u8, sanitized, "Bearer [REDACTED]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sanitized, "[truncated ") != null);
+}
+
+test "run artifacts are written and readable after observer events" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const workspace_dir = try createTestWorkspaceDir(allocator, &tmp);
+    defer allocator.free(workspace_dir);
+
+    const run_id = "run-artifact";
+    const artifact_path = try std.fmt.allocPrint(allocator, "{s}/runs/{s}.jsonl", .{ workspace_dir, run_id });
+    defer allocator.free(artifact_path);
+
+    const sink = try GatewayRunSink.init(allocator, workspace_dir, run_id, testAssertedIdentity(), null);
+    const observer = buildGatewayRunObserver(sink);
+
+    planner_mod.RunObserver.emitPrompt(&observer, "hello");
+    planner_mod.RunObserver.emitToolCall(&observer, "file_read", "{\"path\":\"README.md\"}");
+    planner_mod.RunObserver.emitToolResult(&observer, "file_read", true, "contents");
+    planner_mod.RunObserver.emitModelOutput(&observer, "final answer");
+    sink.deinit();
+
+    const artifact = try std.fs.cwd().readFileAlloc(allocator, artifact_path, 64 * 1024);
+    defer allocator.free(artifact);
+
+    try std.testing.expect(std.mem.indexOf(u8, artifact, "\"type\":\"prompt\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, artifact, "\"type\":\"tool_call\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, artifact, "\"type\":\"tool_result\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, artifact, "\"type\":\"model_output\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, artifact, "\"run_id\":\"run-artifact\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, artifact, "\"user_id\":\"user-42\"") != null);
+}
+
+test "run artifact jsonl never stores raw bearer tokens" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const workspace_dir = try createTestWorkspaceDir(allocator, &tmp);
+    defer allocator.free(workspace_dir);
+
+    const run_id = "run-redaction";
+    const artifact_path = try std.fmt.allocPrint(allocator, "{s}/runs/{s}.jsonl", .{ workspace_dir, run_id });
+    defer allocator.free(artifact_path);
+
+    const sink = try GatewayRunSink.init(allocator, workspace_dir, run_id, testAssertedIdentity(), null);
+    sink.emitToolCall("http_request", "{\"headers\":{\"Authorization\":\"Bearer token-123\"}}");
+    sink.emitError("provider_error", "Bearer token-123 should not persist");
+    sink.deinit();
+
+    const artifact = try std.fs.cwd().readFileAlloc(allocator, artifact_path, 64 * 1024);
+    defer allocator.free(artifact);
+
+    try std.testing.expect(std.mem.indexOf(u8, artifact, "token-123") == null);
+    try std.testing.expect(std.mem.indexOf(u8, artifact, "Bearer [REDACTED]") != null);
 }

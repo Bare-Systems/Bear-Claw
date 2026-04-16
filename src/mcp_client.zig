@@ -19,10 +19,14 @@ const std = @import("std");
 pub const McpTool = struct {
     name:        []const u8,
     description: []const u8,
+    input_schema: ?[]const u8 = null,
+    output_schema: ?[]const u8 = null,
 
     pub fn deinit(self: *McpTool, allocator: std.mem.Allocator) void {
         allocator.free(self.name);
         allocator.free(self.description);
+        if (self.input_schema) |value| allocator.free(value);
+        if (self.output_schema) |value| allocator.free(value);
         self.* = undefined;
     }
 };
@@ -206,9 +210,23 @@ pub const McpSession = struct {
                 break :blk "";
             };
 
+            const input_schema = if (obj.get("inputSchema")) |schema_val|
+                try jsonValueToOwnedSlice(self.allocator, schema_val)
+            else
+                null;
+            errdefer if (input_schema) |value| self.allocator.free(value);
+
+            const output_schema = if (obj.get("outputSchema")) |schema_val|
+                try jsonValueToOwnedSlice(self.allocator, schema_val)
+            else
+                null;
+            errdefer if (output_schema) |value| self.allocator.free(value);
+
             try list.append(McpTool{
                 .name        = try self.allocator.dupe(u8, name_str),
                 .description = try self.allocator.dupe(u8, desc_str),
+                .input_schema = input_schema,
+                .output_schema = output_schema,
             });
         }
 
@@ -294,6 +312,13 @@ pub const McpSession = struct {
         return out.toOwnedSlice();
     }
 };
+
+fn jsonValueToOwnedSlice(allocator: std.mem.Allocator, value: std.json.Value) ![]u8 {
+    var buf = std.ArrayList(u8).init(allocator);
+    errdefer buf.deinit();
+    try std.json.stringify(value, .{}, buf.writer());
+    return buf.toOwnedSlice();
+}
 
 // ── Persistent session pool ───────────────────────────────────────────────────
 // For efficiency we keep one McpSession alive per server argv across the

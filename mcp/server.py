@@ -28,6 +28,8 @@ import urllib.request
 import urllib.error
 from pathlib import Path
 from mcp.server.fastmcp import FastMCP
+from pydantic import BaseModel, Field
+from typing import Literal
 
 # Resolve the repo root relative to this file (mcp/ is one level below root)
 REPO_ROOT = Path(__file__).parent.parent.resolve()
@@ -254,6 +256,14 @@ def _apply_file_patch(patch_json: str) -> str:
     return f"applied {applied} file_patch operation(s)"
 
 
+class FilePatchOperation(BaseModel):
+    op: Literal["add", "update", "delete"]
+    path: str = Field(min_length=1)
+    content: str | None = None
+    old: str | None = None
+    new: str | None = None
+
+
 mcp = FastMCP("bareclaw")
 
 
@@ -446,13 +456,16 @@ def workspace_contents() -> str:
 
 
 @mcp.tool()
-def file_patch(patch_json: str) -> str:
+def file_patch(operations: list[FilePatchOperation]) -> str:
     """Apply add/update/delete file edits inside the BearClaw repo.
 
     Args:
-        patch_json: JSON object with an `operations` array. Example:
-            {"operations":[{"op":"update","path":"src/tools.zig","old":"before","new":"after"}]}
+        operations: Patch operations to apply. Example:
+            [{"op":"update","path":"src/tools.zig","old":"before","new":"after"}]
     """
+    patch_json = json.dumps({
+        "operations": [operation.model_dump(exclude_none=True) for operation in operations]
+    })
     return _apply_file_patch(patch_json)
 
 

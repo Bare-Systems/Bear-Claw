@@ -23,6 +23,35 @@ pub const ExecutionResult = struct {
     }
 };
 
+pub const RunObserver = struct {
+    ctx: *anyopaque,
+    on_prompt: ?*const fn (ctx: *anyopaque, prompt: []const u8) void = null,
+    on_tool_call: ?*const fn (ctx: *anyopaque, tool_name: []const u8, args_json: []const u8) void = null,
+    on_tool_result: ?*const fn (ctx: *anyopaque, tool_name: []const u8, success: bool, output: []const u8) void = null,
+    on_model_output: ?*const fn (ctx: *anyopaque, content: []const u8) void = null,
+    on_error: ?*const fn (ctx: *anyopaque, code: []const u8, message: []const u8) void = null,
+
+    pub fn emitPrompt(self: ?*const RunObserver, prompt: []const u8) void {
+        if (self) |observer| if (observer.on_prompt) |cb| cb(observer.ctx, prompt);
+    }
+
+    pub fn emitToolCall(self: ?*const RunObserver, tool_name: []const u8, args_json: []const u8) void {
+        if (self) |observer| if (observer.on_tool_call) |cb| cb(observer.ctx, tool_name, args_json);
+    }
+
+    pub fn emitToolResult(self: ?*const RunObserver, tool_name: []const u8, success: bool, output: []const u8) void {
+        if (self) |observer| if (observer.on_tool_result) |cb| cb(observer.ctx, tool_name, success, output);
+    }
+
+    pub fn emitModelOutput(self: ?*const RunObserver, content: []const u8) void {
+        if (self) |observer| if (observer.on_model_output) |cb| cb(observer.ctx, content);
+    }
+
+    pub fn emitError(self: ?*const RunObserver, code: []const u8, message: []const u8) void {
+        if (self) |observer| if (observer.on_error) |cb| cb(observer.ctx, code, message);
+    }
+};
+
 pub const ExecuteStepFn = *const fn (
     ctx: *anyopaque,
     tool_name: []const u8,
@@ -69,6 +98,7 @@ pub fn planAndExecute(
     tool_descriptors: []const ToolDescriptor,
     execute_ctx: *anyopaque,
     execute_step: ExecuteStepFn,
+    observer: ?*const RunObserver,
     goal: []const u8,
 ) ![]u8 {
     const latest_reflection = try loadLatestReflection(allocator, memory);
@@ -84,6 +114,7 @@ pub fn planAndExecute(
         0.2,
     );
     defer allocator.free(plan_reply);
+    RunObserver.emitModelOutput(observer, plan_reply);
 
     var steps = try parsePlanSteps(allocator, plan_reply);
     defer {
@@ -121,6 +152,7 @@ pub fn planAndExecute(
             goal,
             steps.items[idx..],
             result,
+            observer,
         );
         defer decision.deinit(allocator);
 
@@ -151,6 +183,7 @@ pub fn planAndExecute(
         model,
         goal,
         execution_log.items,
+        observer,
     );
     defer allocator.free(final_reflection);
 
@@ -221,6 +254,7 @@ fn reflectAfterStep(
     goal: []const u8,
     remaining_steps: []const PlanStep,
     result: ExecutionResult,
+    observer: ?*const RunObserver,
 ) !ReflectionDecision {
     var prompt = std.ArrayList(u8).init(allocator);
     defer prompt.deinit();
@@ -244,6 +278,7 @@ fn reflectAfterStep(
         0.2,
     );
     defer allocator.free(reply);
+    RunObserver.emitModelOutput(observer, reply);
 
     return parseReflectionDecision(allocator, reply);
 }
@@ -254,6 +289,7 @@ fn buildFinalReflection(
     model: []const u8,
     goal: []const u8,
     execution_log: []const u8,
+    observer: ?*const RunObserver,
 ) ![]u8 {
     const prompt = try std.fmt.allocPrint(
         allocator,
@@ -262,12 +298,14 @@ fn buildFinalReflection(
     );
     defer allocator.free(prompt);
 
-    return provider.chatOnce(
+    const reflection = try provider.chatOnce(
         finalReflectionSystemPrompt(),
         prompt,
         model,
         0.3,
     );
+    RunObserver.emitModelOutput(observer, reflection);
+    return reflection;
 }
 
 fn storeReflection(memory: *memory_mod.MemoryBackend, reflection: []const u8) !void {

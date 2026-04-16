@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Tardigrade-asserted operator identity on gateway chat routes:
+  - `/v1/chat` and `/v1/chat/stream` now require `X-Tardigrade-User-ID` plus a `bearclaw.operator` scope in `X-Tardigrade-Scopes`, returning `403` when direct operator traffic bypasses the edge.
+  - Run JSONL artifacts now include the asserted `user_id`, optional `device_id`, and scope string so Stage 2C runs bind to a real operator identity.
 - `tardigrade` command to orchestrate a public edge deployment from BearClaw:
   - launches local BearClaw gateway process
   - launches Tardigrade process with edge env configuration on internal HTTP port
@@ -25,6 +28,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `confirmation_reason: null`
 - Structured JSON error envelopes containing `request_id`.
 - `X-Correlation-ID` echo support on gateway responses when provided by caller.
+- Tool schema standardization across the core and MCP-discovered tool registry:
+  - Added `input_schema` and optional `output_schema` to the BearClaw `Tool` and MCP proxy metadata structs.
+  - BearClaw now validates tool arguments against published JSON Schema before dispatch, returning typed `invalid_input` errors without invoking the tool handler.
+  - The development MCP harness now publishes `file_patch` as structured `operations` input so its public schema matches the real BearClaw tool contract.
+- Run-level gateway observability for chat requests:
+  - Added `X-Run-ID` on gateway responses and `/v1/chat/stream` SSE support for live `prompt`, `tool_call`, `tool_result`, `model_output`, `error`, and `done` events.
+  - Added per-run JSONL artifacts under the BearClaw workspace `runs/` directory.
+  - Added bounded event sanitization so emitted artifacts and stream frames redact bearer tokens and truncate oversized payloads.
 - Audited `file_patch` editing support across BearClaw and the development MCP server:
   - Added `file_patch` to the core Zig tool registry with strict `add`, `update`, and `delete` operations.
   - `update` now rejects stale or ambiguous context, `delete` requires exact file-content match, and every successful mutation is path-validated and logged to `audit.log` before it executes.
