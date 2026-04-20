@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Multi-arch Linux release packaging:
+  - GitHub Actions now builds BearClaw release binaries for both `bareclaw-linux-x86_64` and `bareclaw-linux-aarch64`.
+  - Added `scripts/install.sh` so Linux installs auto-detect the correct release asset for `x86_64` and `aarch64` hosts.
+
+- Koala MCP integration over HTTP:
+  - BearClaw's generic MCP client now supports `http_mcp <url> <bearer_token>` transport definitions in `mcp_servers`, so Koala can be discovered over its `/mcp` JSON-RPC endpoint without a subprocess bridge.
+  - Koala's `koala.*` tools are normalized into the local BearClaw catalog as `koala__toolname`.
+  - BearClaw now applies per-tool local rate limits to Koala proxy calls and returns typed `rate_limited:` / `provider_unavailable:` errors for local throttling and remote outage cases.
+- Run artifact viewer APIs for BearClawWeb:
+  - Added `GET /v1/runs` for recent run summaries with status, timestamps, user, device, and event counts.
+  - Added `GET /v1/runs/:id` to return a run summary plus the redacted JSONL event payloads for rendering in the UI.
+  - Added `GET /v1/runs/:id/stream` to replay and tail run artifacts over SSE so the web UI can render live tool-call progress through Tardigrade-authenticated operator access.
 - Tardigrade-asserted operator identity on gateway chat routes:
   - `/v1/chat` and `/v1/chat/stream` now require `X-Tardigrade-User-ID` plus a `bearclaw.operator` scope in `X-Tardigrade-Scopes`, returning `403` when direct operator traffic bypasses the edge.
   - Run JSONL artifacts now include the asserted `user_id`, optional `device_id`, and scope string so Stage 2C runs bind to a real operator identity.

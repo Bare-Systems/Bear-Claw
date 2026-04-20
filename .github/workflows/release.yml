@@ -10,11 +10,20 @@ permissions:
 
 jobs:
   release-linux:
-    runs-on: ubuntu-latest
+    name: Release ${{ matrix.archive_name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            archive_name: bareclaw-linux-x86_64
+          - os: ubuntu-24.04-arm
+            archive_name: bareclaw-linux-aarch64
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Setup Zig
         uses: mlugg/setup-zig@v2
@@ -33,10 +42,10 @@ jobs:
         run: |
           mkdir -p dist
           cp zig-out/bin/bareclaw dist/bareclaw
-          tar -C dist -czf bareclaw-linux-x86_64.tar.gz bareclaw
+          cp LICENSE dist/LICENSE
+          tar -C dist -czf "${{ matrix.archive_name }}.tar.gz" bareclaw LICENSE
 
       - name: Publish release assets
         uses: softprops/action-gh-release@v2
         with:
-          files: |
-            bareclaw-linux-x86_64.tar.gz
+          files: ${{ matrix.archive_name }}.tar.gz

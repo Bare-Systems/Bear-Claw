@@ -46,6 +46,17 @@ claude mcp add bareclaw mcp/.venv/bin/python3 mcp/server.py
 
 See [`mcp/README.md`](/Users/joecaruso/Projects/BareSystems/BearClaw/mcp/README.md) for the MCP server setup used to develop and exercise BearClaw from agent tooling.
 
+BearClaw can also consume remote MCP servers at runtime. For Koala's HTTP MCP
+endpoint, configure:
+
+```sh
+bareclaw config set mcp_servers "koala=http_mcp http://192.168.86.53:6705/mcp <koala_mcp_token>"
+```
+
+That will discover Koala's `koala.*` tools and expose them inside BearClaw as
+`koala__get_system_health`, `koala__list_cameras`, `koala__get_zone_state`, and
+`koala__check_package_at_door`.
+
 ---
 
 ## Features
@@ -60,7 +71,7 @@ See [`mcp/README.md`](/Users/joecaruso/Projects/BareSystems/BearClaw/mcp/README.
 | **Memory** | Markdown file-per-key store under `~/.bareclaw/workspace/memory/` |
 | **Security** | Path allowlisting, shell command blocklist, append-only audit log |
 | **Cron** | Persistent task scheduler with TSV storage, pause/resume, manual run |
-| **Gateway** | Minimal internal HTTP server (`/health`, `/webhook`, `/v1/chat`) with asserted Tardigrade operator identity enforcement |
+| **Gateway** | Minimal internal HTTP server (`/health`, `/webhook`, `/v1/chat`, `/v1/runs`) with asserted Tardigrade operator identity enforcement |
 | **Daemon** | Gateway + cron runner combined |
 | **Migration** | Import from OpenClaw workspace |
 
@@ -92,14 +103,18 @@ zig build
 zig build test
 ```
 
-### Install latest Linux binary
+### Install latest Linux release
 
 ```bash
-curl -fsSL -o bareclaw-linux-x86_64.tar.gz \
-  https://github.com/Bare-Systems/BearClaw/releases/latest/download/bareclaw-linux-x86_64.tar.gz
-tar -xzf bareclaw-linux-x86_64.tar.gz
-chmod +x bareclaw
-./bareclaw --help
+curl -fsSL https://raw.githubusercontent.com/Bare-Systems/BearClaw/main/scripts/install.sh | sh
+```
+
+The installer auto-detects `x86_64-linux` and `aarch64-linux` release assets.
+To install a specific tag or choose a different directory:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Bare-Systems/BearClaw/main/scripts/install.sh | \
+  BARECLAW_VERSION=v0.3.0 BARECLAW_INSTALL_DIR=/usr/local/bin sh
 ```
 
 ### Setting your API key
@@ -461,12 +476,16 @@ Starts an internal HTTP server on `127.0.0.1:8080`:
 | `/health` | GET | `{"status":"ok","service":"bareclaw"}` |
 | `/webhook` | POST | `{"received":true}` |
 | `/v1/chat` | POST | `{"message":{...},"requires_confirmation":false,"confirmation_reason":null}` |
+| `/v1/runs` | GET | `{"runs":[{"id":"...","status":"done|error|in_progress",...}]}` |
+| `/v1/runs/:id` | GET | `{"run":{...},"events":[...]}` |
+| `/v1/runs/:id/stream` | GET | `text/event-stream` replay/tail of run artifact events |
 
-`/v1/chat` is designed for trusted local callers (for example, Tardigrade edge
-running on the same host). It does not enforce bearer auth directly in this
-MVP. Each connection is handled on its own thread, and agent execution is cut
-off after 30 seconds with `504 Gateway Timeout` instead of blocking the gateway
-indefinitely.
+`/v1/chat`, `/v1/chat/stream`, and the run-artifact endpoints are designed for
+trusted local callers (for example, Tardigrade edge running on the same host).
+They require asserted Tardigrade operator headers rather than direct bearer auth
+at the BearClaw loopback gateway. Each connection is handled on its own thread,
+and agent execution is cut off after 30 seconds with `504 Gateway Timeout`
+instead of blocking the gateway indefinitely.
 
 ### Daemon
 

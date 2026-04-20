@@ -1773,20 +1773,61 @@ pub const McpProxyMeta = struct {
     server_argv: []const []const u8, // slice of owned strings
     /// The tool name as published by the MCP server (may differ from Tool.name).
     mcp_tool_name: []const u8, // owned
+    /// The local BearClaw tool name used by the planner/catalog.
+    local_tool_name: []const u8, // owned
     /// Human-readable description from the MCP server's tools/list response.
     description: []const u8, // owned
     /// JSON Schema published by the MCP server, when available.
     input_schema: ?[]const u8 = null, // owned when present
     output_schema: ?[]const u8 = null, // owned when present
+    rate_limit: ?ProxyRateLimit = null,
 
     pub fn deinit(self: *McpProxyMeta, allocator: std.mem.Allocator) void {
         for (self.server_argv) |arg| allocator.free(arg);
         allocator.free(self.server_argv);
         allocator.free(self.mcp_tool_name);
+        allocator.free(self.local_tool_name);
         allocator.free(self.description);
         if (self.input_schema) |value| allocator.free(value);
         if (self.output_schema) |value| allocator.free(value);
         self.* = undefined;
+    }
+};
+
+const ProxyRateLimitConfig = struct {
+    tokens_per_second: f64,
+    burst: f64,
+};
+
+const ProxyRateLimit = struct {
+    tokens_per_second: f64,
+    burst: f64,
+    tokens: f64,
+    last_refill_ms: i64,
+    mutex: std.Thread.Mutex = .{},
+
+    fn init(config: ProxyRateLimitConfig) ProxyRateLimit {
+        return .{
+            .tokens_per_second = config.tokens_per_second,
+            .burst = config.burst,
+            .tokens = config.burst,
+            .last_refill_ms = std.time.milliTimestamp(),
+        };
+    }
+
+    fn allow(self: *ProxyRateLimit) bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        const now_ms = std.time.milliTimestamp();
+        const elapsed_ms: f64 = @floatFromInt(@max(now_ms - self.last_refill_ms, 0));
+        self.last_refill_ms = now_ms;
+
+        self.tokens = @min(self.burst, self.tokens + ((elapsed_ms / 1000.0) * self.tokens_per_second));
+        if (self.tokens < 1.0) return false;
+
+        self.tokens -= 1.0;
+        return true;
     }
 };
 
@@ -1814,13 +1855,30 @@ fn toolMcpProxy(ctx: *ToolContext, args_json: []const u8) !ToolResult {
 
     ctx.policy.auditLog("mcp_tool", meta.mcp_tool_name) catch {};
 
+    if (meta.rate_limit) |*limit| {
+        if (!limit.allow()) {
+            const msg = try std.fmt.allocPrint(ctx.allocator, "rate_limited: {s}", .{meta.local_tool_name});
+            return ToolResult.owned(false, msg);
+        }
+    }
+
     const session = pool.getOrStart(meta.server_argv) catch |err| {
-        const msg = try std.fmt.allocPrint(ctx.allocator, "mcp: failed to start server: {}", .{err});
+        const msg = switch (err) {
+            error.McpProviderUnavailable => try std.fmt.allocPrint(ctx.allocator, "provider_unavailable: {s}", .{meta.local_tool_name}),
+            error.McpRateLimited => try std.fmt.allocPrint(ctx.allocator, "rate_limited: {s}", .{meta.local_tool_name}),
+            else => try std.fmt.allocPrint(ctx.allocator, "mcp: failed to start server: {}", .{err}),
+        };
         return ToolResult.owned(false, msg);
     };
 
     const result = session.callTool(meta.mcp_tool_name, args_json) catch |err| {
-        const msg = try std.fmt.allocPrint(ctx.allocator, "mcp: call failed: {}", .{err});
+        const msg = switch (err) {
+            error.McpProviderUnavailable => try std.fmt.allocPrint(ctx.allocator, "provider_unavailable: {s}", .{meta.local_tool_name}),
+            error.McpRateLimited => try std.fmt.allocPrint(ctx.allocator, "rate_limited: {s}", .{meta.local_tool_name}),
+            error.McpInvalidInput => try std.fmt.allocPrint(ctx.allocator, "invalid_input: {s}", .{meta.local_tool_name}),
+            error.McpUnauthorized => try std.fmt.allocPrint(ctx.allocator, "provider_unavailable: {s}", .{meta.local_tool_name}),
+            else => try std.fmt.allocPrint(ctx.allocator, "mcp: call failed: {}", .{err}),
+        };
         return ToolResult.owned(false, msg);
     };
 
@@ -1844,6 +1902,32 @@ pub const McpStartupError = struct {
         self.* = undefined;
     }
 };
+
+fn localMcpToolName(server_name: []const u8, remote_tool_name: []const u8) []const u8 {
+    var prefix_buf: [128]u8 = undefined;
+    const prefix = std.fmt.bufPrint(prefix_buf[0..], "{s}.", .{server_name}) catch "";
+    if (prefix.len > 0 and std.mem.startsWith(u8, remote_tool_name, prefix)) {
+        return remote_tool_name[prefix.len..];
+    }
+    return remote_tool_name;
+}
+
+fn koalaRateLimitForTool(server_name: []const u8, local_tool_name: []const u8) ?ProxyRateLimit {
+    if (!std.mem.eql(u8, server_name, "koala")) return null;
+
+    const config: ProxyRateLimitConfig = if (std.mem.eql(u8, local_tool_name, "check_package_at_door"))
+        .{ .tokens_per_second = 1.0, .burst = 1.0 }
+    else if (std.mem.eql(u8, local_tool_name, "get_zone_state"))
+        .{ .tokens_per_second = 2.0, .burst = 2.0 }
+    else if (std.mem.eql(u8, local_tool_name, "list_cameras"))
+        .{ .tokens_per_second = 1.0, .burst = 2.0 }
+    else if (std.mem.eql(u8, local_tool_name, "get_system_health"))
+        .{ .tokens_per_second = 1.0, .burst = 2.0 }
+    else
+        return null;
+
+    return ProxyRateLimit.init(config);
+}
 
 /// Build Tool entries for all tools discovered from a set of MCP servers.
 /// `server_defs` comes from config_mod.parseMcpServers().
@@ -1885,11 +1969,12 @@ pub fn buildMcpTools(
         for (discovered) |mcp_tool| {
             defer {} // mcp_tool strings are owned by discovered; we dupe below
 
+            const local_suffix = localMcpToolName(def.name, mcp_tool.name);
             // Build tool name: "servername__toolname" (double underscore).
             const tool_name = try std.fmt.allocPrint(
                 allocator,
                 "{s}__{s}",
-                .{ def.name, mcp_tool.name },
+                .{ def.name, local_suffix },
             );
             errdefer allocator.free(tool_name);
 
@@ -1904,9 +1989,11 @@ pub fn buildMcpTools(
             meta.* = McpProxyMeta{
                 .server_argv = argv_copy,
                 .mcp_tool_name = try allocator.dupe(u8, mcp_tool.name),
+                .local_tool_name = try allocator.dupe(u8, tool_name),
                 .description = desc_copy,
                 .input_schema = if (mcp_tool.input_schema) |value| try allocator.dupe(u8, value) else null,
                 .output_schema = if (mcp_tool.output_schema) |value| try allocator.dupe(u8, value) else null,
+                .rate_limit = koalaRateLimitForTool(def.name, local_suffix),
             };
 
             try list.append(Tool{
@@ -1931,12 +2018,12 @@ pub fn buildMcpTools(
 /// Free MCP tools built by buildMcpTools().
 pub fn freeMcpTools(allocator: std.mem.Allocator, tools: []Tool) void {
     for (tools) |tool| {
+        allocator.free(tool.name);
         if (tool.user_data) |ud| {
             const meta: *McpProxyMeta = @ptrCast(@alignCast(ud));
             meta.deinit(allocator);
             allocator.destroy(meta);
         }
-        allocator.free(tool.name);
     }
     allocator.free(tools);
 }
@@ -2034,6 +2121,184 @@ const FilePatchTestFixture = struct {
 
 fn runFilePatchForTest(ctx: *ToolContext, args_json: []const u8) !ToolResult {
     return toolFilePatch(ctx, args_json);
+}
+
+const HttpMcpTestServer = struct {
+    allocator: std.mem.Allocator,
+    port: u16,
+    shutdown: std.atomic.Value(bool),
+    call_count: std.atomic.Value(u32),
+    thread: ?std.Thread,
+
+    fn start(allocator: std.mem.Allocator) !*HttpMcpTestServer {
+        const port = try findFreeLocalPortForTest();
+        const server = try allocator.create(HttpMcpTestServer);
+        server.* = .{
+            .allocator = allocator,
+            .port = port,
+            .shutdown = std.atomic.Value(bool).init(false),
+            .call_count = std.atomic.Value(u32).init(0),
+            .thread = null,
+        };
+        server.thread = try std.Thread.spawn(.{}, httpMcpTestServerMain, .{server});
+        std.time.sleep(25 * std.time.ns_per_ms);
+        return server;
+    }
+
+    fn deinit(self: *HttpMcpTestServer) void {
+        self.shutdown.store(true, .release);
+        wakeHttpMcpTestServer(self.port);
+        if (self.thread) |thread| thread.join();
+        self.allocator.destroy(self);
+    }
+
+    fn url(self: *const HttpMcpTestServer) ![]u8 {
+        return std.fmt.allocPrint(self.allocator, "http://127.0.0.1:{d}/mcp", .{self.port});
+    }
+};
+
+fn findFreeLocalPortForTest() !u16 {
+    const address = try std.net.Address.parseIp4("127.0.0.1", 0);
+    var listener = try address.listen(.{ .reuse_address = true });
+    defer listener.deinit();
+    return listener.listen_address.getPort();
+}
+
+fn wakeHttpMcpTestServer(port: u16) void {
+    const address = std.net.Address.parseIp4("127.0.0.1", port) catch return;
+    var stream = std.net.tcpConnectToAddress(address) catch return;
+    defer stream.close();
+    stream.writeAll("POST /mcp HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 0\r\nConnection: close\r\n\r\n") catch {};
+}
+
+fn httpMcpTestServerMain(server: *HttpMcpTestServer) void {
+    const address = std.net.Address.parseIp4("127.0.0.1", server.port) catch return;
+    var listener = address.listen(.{ .reuse_address = true }) catch return;
+    defer listener.deinit();
+
+    const fd = listener.stream.handle;
+    var fds = [_]std.posix.pollfd{.{
+        .fd = fd,
+        .events = std.posix.POLL.IN,
+        .revents = 0,
+    }};
+
+    while (!server.shutdown.load(.acquire)) {
+        const ready = std.posix.poll(&fds, 100) catch break;
+        if (ready == 0) continue;
+
+        const conn = listener.accept() catch continue;
+        handleHttpMcpTestConnection(server, conn) catch {};
+    }
+}
+
+fn handleHttpMcpTestConnection(server: *HttpMcpTestServer, conn: std.net.Server.Connection) !void {
+    defer conn.stream.close();
+
+    var buf: [8192]u8 = undefined;
+    var total_read: usize = 0;
+    while (total_read < buf.len) {
+        const n = try conn.stream.read(buf[total_read..]);
+        if (n == 0) break;
+        total_read += n;
+        if (std.mem.indexOf(u8, buf[0..total_read], "\r\n\r\n") != null) break;
+    }
+
+    const request = buf[0..total_read];
+    const headers_end = std.mem.indexOf(u8, request, "\r\n\r\n") orelse return;
+    const content_length = parseHttpContentLength(request[0..headers_end]) orelse 0;
+    const body_start = headers_end + 4;
+    while (total_read < body_start + content_length and total_read < buf.len) {
+        const n = try conn.stream.read(buf[total_read..]);
+        if (n == 0) break;
+        total_read += n;
+    }
+
+    const body = if (body_start <= total_read) buf[body_start..@min(total_read, body_start + content_length)] else "";
+    const response_body = try buildHttpMcpTestResponse(server.allocator, server, body);
+    defer server.allocator.free(response_body);
+    try writeHttpJsonResponse(conn.stream, "200 OK", response_body);
+}
+
+fn parseHttpContentLength(headers: []const u8) ?usize {
+    var lines = std.mem.splitScalar(u8, headers, '\n');
+    while (lines.next()) |raw_line| {
+        const line = std.mem.trim(u8, raw_line, " \r\t");
+        if (line.len == 0) continue;
+        if (!std.ascii.startsWithIgnoreCase(line, "Content-Length:")) continue;
+        const value = std.mem.trim(u8, line["Content-Length:".len..], " \t");
+        return std.fmt.parseInt(usize, value, 10) catch null;
+    }
+    return null;
+}
+
+fn buildHttpMcpTestResponse(allocator: std.mem.Allocator, server: *HttpMcpTestServer, body: []const u8) ![]u8 {
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, body, .{});
+    defer parsed.deinit();
+
+    const obj = parsed.value.object;
+    const id_value = obj.get("id");
+    const id_json = if (id_value) |value|
+        try jsonStringifyAlloc(allocator, value)
+    else
+        try allocator.dupe(u8, "null");
+    defer allocator.free(id_json);
+
+    const method_value = obj.get("method") orelse return allocator.dupe(u8, "{\"jsonrpc\":\"2.0\",\"id\":null,\"error\":{\"code\":-32600,\"message\":\"Invalid Request\"}}");
+    if (method_value != .string) return allocator.dupe(u8, "{\"jsonrpc\":\"2.0\",\"id\":null,\"error\":{\"code\":-32600,\"message\":\"Invalid Request\"}}");
+
+    if (std.mem.eql(u8, method_value.string, "initialize")) {
+        return std.fmt.allocPrint(
+            allocator,
+            "{{\"jsonrpc\":\"2.0\",\"id\":{s},\"result\":{{\"protocolVersion\":\"2025-11-25\",\"capabilities\":{{\"tools\":{{}}}},\"serverInfo\":{{\"name\":\"koala\",\"version\":\"test\"}}}}}}",
+            .{id_json},
+        );
+    }
+
+    if (std.mem.eql(u8, method_value.string, "tools/list")) {
+        return std.fmt.allocPrint(
+            allocator,
+            "{{\"jsonrpc\":\"2.0\",\"id\":{s},\"result\":{{\"tools\":[" ++
+                "{{\"name\":\"koala.get_system_health\",\"description\":\"health\",\"inputSchema\":{{\"type\":\"object\",\"properties\":{{}},\"additionalProperties\":false}}}}," ++
+                "{{\"name\":\"koala.get_zone_state\",\"description\":\"zone\",\"inputSchema\":{{\"type\":\"object\",\"properties\":{{\"zone_id\":{{\"type\":\"string\"}}}},\"required\":[\"zone_id\"],\"additionalProperties\":false}}}}," ++
+                "{{\"name\":\"koala.check_package_at_door\",\"description\":\"pkg\",\"inputSchema\":{{\"type\":\"object\",\"properties\":{{}},\"additionalProperties\":false}}}}" ++
+                "]}}}}",
+            .{id_json},
+        );
+    }
+
+    if (std.mem.eql(u8, method_value.string, "tools/call")) {
+        _ = server.call_count.fetchAdd(1, .monotonic);
+        return std.fmt.allocPrint(
+            allocator,
+            "{{\"jsonrpc\":\"2.0\",\"id\":{s},\"result\":{{\"content\":[{{\"type\":\"text\",\"text\":\"{{\\\"status\\\":\\\"ok\\\",\\\"explanation\\\":\\\"ok\\\"}}\"}}],\"structuredContent\":{{\"status\":\"ok\",\"explanation\":\"ok\"}},\"isError\":false}}}}",
+            .{id_json},
+        );
+    }
+
+    return std.fmt.allocPrint(
+        allocator,
+        "{{\"jsonrpc\":\"2.0\",\"id\":{s},\"error\":{{\"code\":-32601,\"message\":\"Method not found\"}}}}",
+        .{id_json},
+    );
+}
+
+fn jsonStringifyAlloc(allocator: std.mem.Allocator, value: std.json.Value) ![]u8 {
+    var out = std.ArrayList(u8).init(allocator);
+    errdefer out.deinit();
+    try std.json.stringify(value, .{}, out.writer());
+    return out.toOwnedSlice();
+}
+
+fn writeHttpJsonResponse(stream: std.net.Stream, status: []const u8, body: []const u8) !void {
+    try stream.writer().print(
+        "HTTP/1.1 {s}\r\n" ++
+            "Content-Type: application/json\r\n" ++
+            "Content-Length: {d}\r\n" ++
+            "Connection: close\r\n\r\n" ++
+            "{s}",
+        .{ status, body.len, body },
+    );
 }
 
 test "file_patch rejects stale update context" {
@@ -2230,4 +2495,254 @@ test "awaitHttpRequestJob reports timeout for slow worker" {
 
     var thread = try std.Thread.spawn(.{}, testSlowHttpJobWorker, .{job});
     try std.testing.expectError(error.ToolTimedOut, awaitHttpRequestJob(std.testing.allocator, job, &thread, 0));
+}
+
+fn makeHttpMcpServerDef(allocator: std.mem.Allocator, name: []const u8, url: []const u8, token: []const u8) !@import("config.zig").McpServerDef {
+    var argv = try allocator.alloc([]const u8, 3);
+    argv[0] = try allocator.dupe(u8, "http_mcp");
+    argv[1] = try allocator.dupe(u8, url);
+    argv[2] = try allocator.dupe(u8, token);
+    return .{
+        .name = try allocator.dupe(u8, name),
+        .argv = argv,
+    };
+}
+
+fn makeMcpToolContext(
+    allocator: std.mem.Allocator,
+    cfg: *const @import("config.zig").Config,
+    policy: *security_mod.SecurityPolicy,
+    memory: *memory_mod.MemoryBackend,
+    tools: []const Tool,
+    pool: *mcp_mod.McpSessionPool,
+) ToolContext {
+    return .{
+        .allocator = allocator,
+        .cfg = cfg,
+        .policy = policy,
+        .memory = memory,
+        .all_tools = tools,
+        .mcp_pool = pool,
+    };
+}
+
+fn executeMcpToolForTest(ctx: *ToolContext, tool: Tool, args_json: []const u8) !ToolResult {
+    ctx.mcp_current_meta = tool.user_data;
+    defer ctx.mcp_current_meta = null;
+    return executeTool(ctx, tool, args_json);
+}
+
+test "buildMcpTools discovers Koala HTTP MCP tools with koala__ aliases" {
+    const allocator = std.testing.allocator;
+    var server = try HttpMcpTestServer.start(allocator);
+    defer server.deinit();
+
+    const url = try server.url();
+    defer allocator.free(url);
+
+    var def = try makeHttpMcpServerDef(allocator, "koala", url, "test-token");
+    defer def.deinit(allocator);
+
+    var pool: mcp_mod.McpSessionPool = undefined;
+    var errors: []McpStartupError = &[_]McpStartupError{};
+    const tools = try buildMcpTools(allocator, &[_]@import("config.zig").McpServerDef{def}, &pool, &errors);
+    defer {
+        for (errors) |*err| @constCast(err).deinit(allocator);
+        allocator.free(errors);
+        freeMcpTools(allocator, tools);
+        pool.deinit();
+    }
+
+    try std.testing.expectEqual(@as(usize, 0), errors.len);
+
+    var found_health = false;
+    var found_zone = false;
+    var found_package = false;
+    for (tools) |tool| {
+        if (std.mem.eql(u8, tool.name, "koala__get_system_health")) found_health = true;
+        if (std.mem.eql(u8, tool.name, "koala__get_zone_state")) found_zone = true;
+        if (std.mem.eql(u8, tool.name, "koala__check_package_at_door")) found_package = true;
+    }
+    try std.testing.expect(found_health);
+    try std.testing.expect(found_zone);
+    try std.testing.expect(found_package);
+}
+
+test "Koala MCP invalid args fail in BearClaw before remote call" {
+    const allocator = std.testing.allocator;
+    var server = try HttpMcpTestServer.start(allocator);
+    defer server.deinit();
+
+    const url = try server.url();
+    defer allocator.free(url);
+
+    var def = try makeHttpMcpServerDef(allocator, "koala", url, "test-token");
+    defer def.deinit(allocator);
+
+    var pool: mcp_mod.McpSessionPool = undefined;
+    var errors: []McpStartupError = &[_]McpStartupError{};
+    const tools = try buildMcpTools(allocator, &[_]@import("config.zig").McpServerDef{def}, &pool, &errors);
+    defer {
+        for (errors) |*err| @constCast(err).deinit(allocator);
+        allocator.free(errors);
+        freeMcpTools(allocator, tools);
+        pool.deinit();
+    }
+
+    const cfg = @import("config.zig").Config{
+        .workspace_dir = "/tmp",
+        .config_path = "/tmp/test_config.toml",
+        .default_provider = "echo",
+        .default_model = "test",
+        .memory_backend = "markdown",
+        .fallback_providers = "",
+        .api_key = "",
+        .discord_token = "",
+        .discord_webhook = "",
+        .discord_notify_channel = "",
+        .telegram_token = "",
+        .mcp_servers = "",
+        .system_prompt = "",
+        .allowed_paths = "",
+    };
+
+    var policy = security_mod.SecurityPolicy.initWorkspaceOnly(allocator, &cfg);
+    defer policy.deinit(allocator);
+    var memory = try memory_mod.createMemoryBackend(allocator, &cfg);
+    defer memory.deinit();
+
+    var ctx = makeMcpToolContext(allocator, &cfg, &policy, &memory, tools, &pool);
+    const zone_tool = blk: {
+        for (tools) |tool| {
+            if (std.mem.eql(u8, tool.name, "koala__get_zone_state")) break :blk tool;
+        }
+        return error.TestUnexpectedResult;
+    };
+
+    const result = try executeMcpToolForTest(&ctx, zone_tool, "{}");
+    defer if (result.allocated) allocator.free(result.output);
+
+    try std.testing.expect(!result.success);
+    try std.testing.expect(std.mem.startsWith(u8, result.output, "invalid_input: "));
+    try std.testing.expectEqual(@as(u32, 0), server.call_count.load(.monotonic));
+}
+
+test "Koala MCP local rate limit returns typed error" {
+    const allocator = std.testing.allocator;
+    var server = try HttpMcpTestServer.start(allocator);
+    defer server.deinit();
+
+    const url = try server.url();
+    defer allocator.free(url);
+
+    var def = try makeHttpMcpServerDef(allocator, "koala", url, "test-token");
+    defer def.deinit(allocator);
+
+    var pool: mcp_mod.McpSessionPool = undefined;
+    var errors: []McpStartupError = &[_]McpStartupError{};
+    const tools = try buildMcpTools(allocator, &[_]@import("config.zig").McpServerDef{def}, &pool, &errors);
+    defer {
+        for (errors) |*err| @constCast(err).deinit(allocator);
+        allocator.free(errors);
+        freeMcpTools(allocator, tools);
+        pool.deinit();
+    }
+
+    const cfg = @import("config.zig").Config{
+        .workspace_dir = "/tmp",
+        .config_path = "/tmp/test_config.toml",
+        .default_provider = "echo",
+        .default_model = "test",
+        .memory_backend = "markdown",
+        .fallback_providers = "",
+        .api_key = "",
+        .discord_token = "",
+        .discord_webhook = "",
+        .discord_notify_channel = "",
+        .telegram_token = "",
+        .mcp_servers = "",
+        .system_prompt = "",
+        .allowed_paths = "",
+    };
+
+    var policy = security_mod.SecurityPolicy.initWorkspaceOnly(allocator, &cfg);
+    defer policy.deinit(allocator);
+    var memory = try memory_mod.createMemoryBackend(allocator, &cfg);
+    defer memory.deinit();
+
+    var ctx = makeMcpToolContext(allocator, &cfg, &policy, &memory, tools, &pool);
+    const package_tool = blk: {
+        for (tools) |tool| {
+            if (std.mem.eql(u8, tool.name, "koala__check_package_at_door")) break :blk tool;
+        }
+        return error.TestUnexpectedResult;
+    };
+
+    const first = try executeMcpToolForTest(&ctx, package_tool, "{}");
+    defer if (first.allocated) allocator.free(first.output);
+    try std.testing.expect(first.success);
+
+    const second = try executeMcpToolForTest(&ctx, package_tool, "{}");
+    defer if (second.allocated) allocator.free(second.output);
+    try std.testing.expect(!second.success);
+    try std.testing.expectEqualStrings("rate_limited: koala__check_package_at_door", second.output);
+    try std.testing.expectEqual(@as(u32, 1), server.call_count.load(.monotonic));
+}
+
+test "Koala MCP unavailable returns provider_unavailable" {
+    const allocator = std.testing.allocator;
+    var server = try HttpMcpTestServer.start(allocator);
+
+    const url = try server.url();
+    defer allocator.free(url);
+
+    var def = try makeHttpMcpServerDef(allocator, "koala", url, "test-token");
+    defer def.deinit(allocator);
+
+    var pool: mcp_mod.McpSessionPool = undefined;
+    var errors: []McpStartupError = &[_]McpStartupError{};
+    const tools = try buildMcpTools(allocator, &[_]@import("config.zig").McpServerDef{def}, &pool, &errors);
+    defer {
+        for (errors) |*err| @constCast(err).deinit(allocator);
+        allocator.free(errors);
+        freeMcpTools(allocator, tools);
+        pool.deinit();
+    }
+
+    server.deinit();
+
+    const cfg = @import("config.zig").Config{
+        .workspace_dir = "/tmp",
+        .config_path = "/tmp/test_config.toml",
+        .default_provider = "echo",
+        .default_model = "test",
+        .memory_backend = "markdown",
+        .fallback_providers = "",
+        .api_key = "",
+        .discord_token = "",
+        .discord_webhook = "",
+        .discord_notify_channel = "",
+        .telegram_token = "",
+        .mcp_servers = "",
+        .system_prompt = "",
+        .allowed_paths = "",
+    };
+
+    var policy = security_mod.SecurityPolicy.initWorkspaceOnly(allocator, &cfg);
+    defer policy.deinit(allocator);
+    var memory = try memory_mod.createMemoryBackend(allocator, &cfg);
+    defer memory.deinit();
+
+    var ctx = makeMcpToolContext(allocator, &cfg, &policy, &memory, tools, &pool);
+    const health_tool = blk: {
+        for (tools) |tool| {
+            if (std.mem.eql(u8, tool.name, "koala__get_system_health")) break :blk tool;
+        }
+        return error.TestUnexpectedResult;
+    };
+
+    const result = try executeMcpToolForTest(&ctx, health_tool, "{}");
+    defer if (result.allocated) allocator.free(result.output);
+    try std.testing.expect(!result.success);
+    try std.testing.expectEqualStrings("provider_unavailable: koala__get_system_health", result.output);
 }

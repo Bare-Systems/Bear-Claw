@@ -4,6 +4,9 @@
 ///   GET  /health   -> 200 {"status":"ok","service":"bareclaw"}
 ///   POST /webhook  -> 200 {"received":true}
 ///   POST /v1/chat  -> 200 ChatResponse envelope
+///   GET  /v1/runs  -> 200 recent run summaries
+///   GET  /v1/runs/:id -> 200 run artifact detail
+///   GET  /v1/runs/:id/stream -> 200 SSE replay/tail of run artifact
 ///
 /// Security model:
 /// - Binds to localhost only (127.0.0.1)
@@ -21,12 +24,40 @@ const MAX_REQUEST_BYTES: usize = 256 * 1024;
 const MAX_MESSAGE_CHARS: usize = 4000;
 const AGENT_EXECUTION_TIMEOUT_SECONDS: u64 = 120;
 const MAX_RUN_EVENT_CHARS: usize = 4096;
+const MAX_RUN_ARTIFACT_BYTES: usize = 2 * 1024 * 1024;
+const MAX_LISTED_RUNS: usize = 32;
+const RUN_STREAM_IDLE_TIMEOUT_MS: i64 = 15_000;
+const RUN_STREAM_POLL_INTERVAL_MS: u64 = 200;
 const REQUIRED_OPERATOR_SCOPE = "bearclaw.operator";
 
 const AssertedIdentity = struct {
     user_id: []const u8,
     device_id: ?[]const u8,
     scopes: []const u8,
+};
+
+const RunRoute = struct {
+    run_id: []const u8,
+    stream: bool,
+};
+
+const RunSummary = struct {
+    id: []u8,
+    user_id: []u8,
+    device_id: ?[]u8,
+    scopes: []u8,
+    status: []u8,
+    started_at: i64,
+    updated_at: i64,
+    event_count: usize,
+
+    fn deinit(self: RunSummary, allocator: std.mem.Allocator) void {
+        allocator.free(self.id);
+        allocator.free(self.user_id);
+        if (self.device_id) |value| allocator.free(value);
+        allocator.free(self.scopes);
+        allocator.free(self.status);
+    }
 };
 
 const GatewayRunSink = struct {
@@ -126,11 +157,7 @@ const GatewayRunSink = struct {
         defer self.mutex.unlock();
         if (!self.active) return;
 
-        if (self.stream) |stream| {
-            const payload = buildMinimalRunEventJson(self.allocator, self.run_id, self.user_id, self.device_id, self.scopes, "done") catch return;
-            defer self.allocator.free(payload);
-            sendSseFrame(stream, "done", payload) catch {};
-        }
+        self.writeEventLocked(.{ .event_type = "done" });
         self.active = false;
     }
 
@@ -231,7 +258,7 @@ pub fn runGateway(port: u16) !void {
     defer server.deinit();
 
     try stdout.print("BearClaw gateway listening on http://127.0.0.1:{d}\n", .{port});
-    try stdout.print("Endpoints: GET /health  POST /webhook  POST /v1/chat  POST /v1/chat/stream\n", .{});
+    try stdout.print("Endpoints: GET /health  POST /webhook  POST /v1/chat  POST /v1/chat/stream  GET /v1/runs  GET /v1/runs/:id  GET /v1/runs/:id/stream\n", .{});
 
     while (true) {
         const conn = server.accept() catch |err| {
@@ -319,6 +346,75 @@ fn handleConnection(allocator: std.mem.Allocator, conn: std.net.Server.Connectio
             return;
         }
         try sendJson(conn.stream, "200 OK", "{\"received\":true}", request_id);
+        return;
+    }
+
+    if (std.mem.eql(u8, path, "/v1/runs")) {
+        if (!std.mem.eql(u8, method, "GET")) {
+            const payload = try std.fmt.allocPrint(allocator, "{{\"code\":\"invalid_request\",\"message\":\"method not allowed\",\"request_id\":\"{s}\"}}", .{request_id});
+            defer allocator.free(payload);
+            try sendJson(conn.stream, "405 Method Not Allowed", payload, request_id);
+            return;
+        }
+
+        _ = parseAssertedIdentity(request[0..headers_end]) orelse {
+            const payload = try std.fmt.allocPrint(allocator, "{{\"code\":\"forbidden\",\"message\":\"asserted tardigrade identity required\",\"request_id\":\"{s}\"}}", .{request_id});
+            defer allocator.free(payload);
+            try sendJson(conn.stream, "403 Forbidden", payload, request_id);
+            return;
+        };
+
+        var workspace_cfg = try config_mod.loadOrInit(allocator);
+        defer workspace_cfg.deinit(allocator);
+
+        const payload = try buildRunsListResponse(allocator, workspace_cfg.workspace_dir);
+        defer allocator.free(payload);
+        try sendJson(conn.stream, "200 OK", payload, request_id);
+        return;
+    }
+
+    if (parseRunRoute(path)) |run_route| {
+        if (!std.mem.eql(u8, method, "GET")) {
+            const payload = try std.fmt.allocPrint(allocator, "{{\"code\":\"invalid_request\",\"message\":\"method not allowed\",\"request_id\":\"{s}\"}}", .{request_id});
+            defer allocator.free(payload);
+            try sendJson(conn.stream, "405 Method Not Allowed", payload, request_id);
+            return;
+        }
+
+        _ = parseAssertedIdentity(request[0..headers_end]) orelse {
+            const payload = try std.fmt.allocPrint(allocator, "{{\"code\":\"forbidden\",\"message\":\"asserted tardigrade identity required\",\"request_id\":\"{s}\"}}", .{request_id});
+            defer allocator.free(payload);
+            try sendJson(conn.stream, "403 Forbidden", payload, request_id);
+            return;
+        };
+
+        var workspace_cfg = try config_mod.loadOrInit(allocator);
+        defer workspace_cfg.deinit(allocator);
+
+        if (run_route.stream) {
+            streamRunArtifact(conn.stream, allocator, workspace_cfg.workspace_dir, run_route.run_id) catch |err| switch (err) {
+                error.FileNotFound, error.InvalidRunId => {
+                    const payload = try std.fmt.allocPrint(allocator, "{{\"code\":\"not_found\",\"message\":\"run not found\",\"request_id\":\"{s}\"}}", .{request_id});
+                    defer allocator.free(payload);
+                    try sendJson(conn.stream, "404 Not Found", payload, request_id);
+                    return;
+                },
+                else => return err,
+            };
+            return;
+        }
+
+        const payload = buildRunDetailResponse(allocator, workspace_cfg.workspace_dir, run_route.run_id) catch |err| switch (err) {
+            error.FileNotFound, error.InvalidRunId => {
+                const not_found = try std.fmt.allocPrint(allocator, "{{\"code\":\"not_found\",\"message\":\"run not found\",\"request_id\":\"{s}\"}}", .{request_id});
+                defer allocator.free(not_found);
+                try sendJson(conn.stream, "404 Not Found", not_found, request_id);
+                return;
+            },
+            else => return err,
+        };
+        defer allocator.free(payload);
+        try sendJson(conn.stream, "200 OK", payload, request_id);
         return;
     }
 
@@ -440,6 +536,8 @@ fn handleConnection(allocator: std.mem.Allocator, conn: std.net.Server.Connectio
             sink.finishStream();
             return;
         }
+
+        sink.finishStream();
 
         const response_payload = try buildChatResponse(allocator, reply);
         defer allocator.free(response_payload);
@@ -634,6 +732,297 @@ fn buildChatResponse(allocator: std.mem.Allocator, reply: []const u8) ![]u8 {
         "{{\"message\":{{\"id\":\"{s}\",\"role\":\"assistant\",\"content\":{s},\"timestamp\":{d}}},\"requires_confirmation\":false,\"confirmation_reason\":null}}",
         .{ id, std.json.fmt(reply, .{}), apple_ref_ts },
     );
+}
+
+fn buildRunsListResponse(allocator: std.mem.Allocator, workspace_dir: []const u8) ![]u8 {
+    var summaries = try loadRunSummaries(allocator, workspace_dir);
+    defer {
+        for (summaries.items) |summary| summary.deinit(allocator);
+        summaries.deinit();
+    }
+
+    var out = std.ArrayList(u8).init(allocator);
+    errdefer out.deinit();
+
+    try out.appendSlice("{\"runs\":[");
+    for (summaries.items, 0..) |summary, index| {
+        if (index > 0) try out.append(',');
+        try appendRunSummaryJson(out.writer(), summary);
+    }
+    try out.appendSlice("]}");
+    return out.toOwnedSlice();
+}
+
+fn buildRunDetailResponse(allocator: std.mem.Allocator, workspace_dir: []const u8, run_id: []const u8) ![]u8 {
+    const artifact = try readRunArtifact(allocator, workspace_dir, run_id);
+    defer allocator.free(artifact);
+
+    const summary = try inspectRunArtifact(allocator, run_id, artifact);
+    defer summary.deinit(allocator);
+
+    var out = std.ArrayList(u8).init(allocator);
+    errdefer out.deinit();
+
+    try out.appendSlice("{\"run\":");
+    try appendRunSummaryJson(out.writer(), summary);
+    try out.appendSlice(",\"events\":[");
+
+    var line_it = std.mem.splitScalar(u8, artifact, '\n');
+    var event_index: usize = 0;
+    while (line_it.next()) |raw_line| {
+        const line = std.mem.trim(u8, raw_line, " \r\t");
+        if (line.len == 0) continue;
+        if (event_index > 0) try out.append(',');
+        try out.appendSlice(line);
+        event_index += 1;
+    }
+
+    try out.appendSlice("]}");
+    return out.toOwnedSlice();
+}
+
+fn loadRunSummaries(allocator: std.mem.Allocator, workspace_dir: []const u8) !std.ArrayList(RunSummary) {
+    var summaries = std.ArrayList(RunSummary).init(allocator);
+    errdefer {
+        for (summaries.items) |summary| summary.deinit(allocator);
+        summaries.deinit();
+    }
+
+    const runs_dir = try std.fmt.allocPrint(allocator, "{s}/runs", .{workspace_dir});
+    defer allocator.free(runs_dir);
+
+    var dir = std.fs.cwd().openDir(runs_dir, .{ .iterate = true }) catch |err| switch (err) {
+        error.FileNotFound => return summaries,
+        else => return err,
+    };
+    defer dir.close();
+
+    var iter = dir.iterate();
+    while (try iter.next()) |entry| {
+        if (entry.kind != .file) continue;
+        if (!std.mem.endsWith(u8, entry.name, ".jsonl")) continue;
+
+        const run_id = entry.name[0 .. entry.name.len - ".jsonl".len];
+        if (!isValidRunId(run_id)) continue;
+
+        const artifact_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ runs_dir, entry.name });
+        defer allocator.free(artifact_path);
+
+        const artifact = try std.fs.cwd().readFileAlloc(allocator, artifact_path, MAX_RUN_ARTIFACT_BYTES);
+        defer allocator.free(artifact);
+
+        try summaries.append(try inspectRunArtifact(allocator, run_id, artifact));
+    }
+
+    std.mem.sort(RunSummary, summaries.items, {}, struct {
+        fn lessThan(_: void, a: RunSummary, b: RunSummary) bool {
+            if (a.updated_at == b.updated_at) return std.mem.order(u8, a.id, b.id) == .lt;
+            return a.updated_at > b.updated_at;
+        }
+    }.lessThan);
+
+    if (summaries.items.len > MAX_LISTED_RUNS) {
+        var i = MAX_LISTED_RUNS;
+        while (i < summaries.items.len) : (i += 1) summaries.items[i].deinit(allocator);
+        summaries.shrinkRetainingCapacity(MAX_LISTED_RUNS);
+    }
+
+    return summaries;
+}
+
+fn inspectRunArtifact(allocator: std.mem.Allocator, run_id: []const u8, artifact: []const u8) !RunSummary {
+    var first_user_id: ?[]u8 = null;
+    errdefer if (first_user_id) |value| allocator.free(value);
+
+    var first_device_id: ?[]u8 = null;
+    errdefer if (first_device_id) |value| allocator.free(value);
+
+    var first_scopes: ?[]u8 = null;
+    errdefer if (first_scopes) |value| allocator.free(value);
+
+    var last_status: ?[]u8 = null;
+    errdefer if (last_status) |value| allocator.free(value);
+
+    var started_at: i64 = 0;
+    var updated_at: i64 = 0;
+    var event_count: usize = 0;
+
+    var line_it = std.mem.splitScalar(u8, artifact, '\n');
+    while (line_it.next()) |raw_line| {
+        const line = std.mem.trim(u8, raw_line, " \r\t");
+        if (line.len == 0) continue;
+
+        var parsed = try std.json.parseFromSlice(std.json.Value, allocator, line, .{});
+        defer parsed.deinit();
+
+        const obj = parsed.value.object;
+
+        if (first_user_id == null) {
+            const user_value = obj.get("user_id") orelse return error.InvalidRunArtifact;
+            if (user_value != .string or user_value.string.len == 0) return error.InvalidRunArtifact;
+            first_user_id = try allocator.dupe(u8, user_value.string);
+        }
+
+        if (first_scopes == null) {
+            const scopes_value = obj.get("scopes") orelse return error.InvalidRunArtifact;
+            if (scopes_value != .string) return error.InvalidRunArtifact;
+            first_scopes = try allocator.dupe(u8, scopes_value.string);
+        }
+
+        if (first_device_id == null) {
+            if (obj.get("device_id")) |device_value| {
+                switch (device_value) {
+                    .null => {},
+                    .string => first_device_id = try allocator.dupe(u8, device_value.string),
+                    else => return error.InvalidRunArtifact,
+                }
+            }
+        }
+
+        const ts_value = obj.get("ts") orelse return error.InvalidRunArtifact;
+        const ts = switch (ts_value) {
+            .integer => ts_value.integer,
+            else => return error.InvalidRunArtifact,
+        };
+
+        const type_value = obj.get("type") orelse return error.InvalidRunArtifact;
+        if (type_value != .string) return error.InvalidRunArtifact;
+
+        if (event_count == 0) started_at = ts;
+        updated_at = ts;
+        event_count += 1;
+
+        if (last_status) |value| allocator.free(value);
+        last_status = try allocator.dupe(u8, statusForRunEventType(type_value.string));
+    }
+
+    const user_id = first_user_id orelse return error.InvalidRunArtifact;
+    const scopes = first_scopes orelse return error.InvalidRunArtifact;
+    const status = last_status orelse try allocator.dupe(u8, "unknown");
+
+    return .{
+        .id = try allocator.dupe(u8, run_id),
+        .user_id = user_id,
+        .device_id = first_device_id,
+        .scopes = scopes,
+        .status = status,
+        .started_at = started_at,
+        .updated_at = updated_at,
+        .event_count = event_count,
+    };
+}
+
+fn appendRunSummaryJson(writer: anytype, summary: RunSummary) !void {
+    try writer.print(
+        "{{\"id\":{s},\"user_id\":{s},\"device_id\":",
+        .{ std.json.fmt(summary.id, .{}), std.json.fmt(summary.user_id, .{}) },
+    );
+    if (summary.device_id) |value| {
+        try writer.print("{s}", .{std.json.fmt(value, .{})});
+    } else {
+        try writer.writeAll("null");
+    }
+    try writer.print(
+        ",\"scopes\":{s},\"status\":{s},\"started_at\":{d},\"updated_at\":{d},\"event_count\":{d}}}",
+        .{
+            std.json.fmt(summary.scopes, .{}),
+            std.json.fmt(summary.status, .{}),
+            summary.started_at,
+            summary.updated_at,
+            summary.event_count,
+        },
+    );
+}
+
+fn readRunArtifact(allocator: std.mem.Allocator, workspace_dir: []const u8, run_id: []const u8) ![]u8 {
+    if (!isValidRunId(run_id)) return error.InvalidRunId;
+    const artifact_path = try std.fmt.allocPrint(allocator, "{s}/runs/{s}.jsonl", .{ workspace_dir, run_id });
+    defer allocator.free(artifact_path);
+    return std.fs.cwd().readFileAlloc(allocator, artifact_path, MAX_RUN_ARTIFACT_BYTES);
+}
+
+fn parseRunRoute(path: []const u8) ?RunRoute {
+    const prefix = "/v1/runs/";
+    if (!std.mem.startsWith(u8, path, prefix)) return null;
+
+    const remainder = path[prefix.len..];
+    if (remainder.len == 0) return null;
+
+    const slash_index = std.mem.indexOfScalar(u8, remainder, '/') orelse return .{
+        .run_id = remainder,
+        .stream = false,
+    };
+
+    if (slash_index == 0) return null;
+    if (!std.mem.eql(u8, remainder[slash_index + 1 ..], "stream")) return null;
+
+    return .{
+        .run_id = remainder[0..slash_index],
+        .stream = true,
+    };
+}
+
+fn isValidRunId(run_id: []const u8) bool {
+    if (run_id.len == 0) return false;
+    for (run_id) |ch| {
+        if (std.ascii.isAlphanumeric(ch) or ch == '-' or ch == '_') continue;
+        return false;
+    }
+    return true;
+}
+
+fn statusForRunEventType(event_type: []const u8) []const u8 {
+    if (std.mem.eql(u8, event_type, "done")) return "done";
+    if (std.mem.eql(u8, event_type, "error")) return "error";
+    return "in_progress";
+}
+
+fn streamRunArtifact(stream: std.net.Stream, allocator: std.mem.Allocator, workspace_dir: []const u8, run_id: []const u8) !void {
+    if (!isValidRunId(run_id)) return error.InvalidRunId;
+
+    const artifact_path = try std.fmt.allocPrint(allocator, "{s}/runs/{s}.jsonl", .{ workspace_dir, run_id });
+    defer allocator.free(artifact_path);
+
+    _ = try std.fs.cwd().statFile(artifact_path);
+    try sendSseHeaders(stream, run_id);
+
+    var sent_bytes: usize = 0;
+    const deadline_ms = std.time.milliTimestamp() + RUN_STREAM_IDLE_TIMEOUT_MS;
+
+    while (true) {
+        const artifact = try std.fs.cwd().readFileAlloc(allocator, artifact_path, MAX_RUN_ARTIFACT_BYTES);
+        defer allocator.free(artifact);
+
+        if (artifact.len > sent_bytes) {
+            var terminal_seen = false;
+            try appendArtifactSseFrames(stream.writer(), allocator, artifact[sent_bytes..], &terminal_seen);
+            sent_bytes = artifact.len;
+            if (terminal_seen) return;
+        }
+
+        if (std.time.milliTimestamp() >= deadline_ms) return;
+        std.Thread.sleep(RUN_STREAM_POLL_INTERVAL_MS * std.time.ns_per_ms);
+    }
+}
+
+fn appendArtifactSseFrames(writer: anytype, allocator: std.mem.Allocator, artifact_delta: []const u8, terminal_seen: *bool) !void {
+    var line_it = std.mem.splitScalar(u8, artifact_delta, '\n');
+    while (line_it.next()) |raw_line| {
+        const line = std.mem.trim(u8, raw_line, " \r\t");
+        if (line.len == 0) continue;
+
+        var parsed = try std.json.parseFromSlice(std.json.Value, allocator, line, .{});
+        defer parsed.deinit();
+
+        const obj = parsed.value.object;
+        const type_value = obj.get("type") orelse return error.InvalidRunArtifact;
+        if (type_value != .string) return error.InvalidRunArtifact;
+
+        try appendSseFrame(writer, type_value.string, line);
+        if (std.mem.eql(u8, type_value.string, "done") or std.mem.eql(u8, type_value.string, "error")) {
+            terminal_seen.* = true;
+        }
+    }
 }
 
 fn isBearerSecretByte(c: u8) bool {
@@ -1159,6 +1548,7 @@ test "run artifacts are written and readable after observer events" {
     planner_mod.RunObserver.emitToolCall(&observer, "file_read", "{\"path\":\"README.md\"}");
     planner_mod.RunObserver.emitToolResult(&observer, "file_read", true, "contents");
     planner_mod.RunObserver.emitModelOutput(&observer, "final answer");
+    sink.finishStream();
     sink.deinit();
 
     const artifact = try std.fs.cwd().readFileAlloc(allocator, artifact_path, 64 * 1024);
@@ -1168,6 +1558,7 @@ test "run artifacts are written and readable after observer events" {
     try std.testing.expect(std.mem.indexOf(u8, artifact, "\"type\":\"tool_call\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, artifact, "\"type\":\"tool_result\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, artifact, "\"type\":\"model_output\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, artifact, "\"type\":\"done\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, artifact, "\"run_id\":\"run-artifact\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, artifact, "\"user_id\":\"user-42\"") != null);
 }
@@ -1194,4 +1585,38 @@ test "run artifact jsonl never stores raw bearer tokens" {
 
     try std.testing.expect(std.mem.indexOf(u8, artifact, "token-123") == null);
     try std.testing.expect(std.mem.indexOf(u8, artifact, "Bearer [REDACTED]") != null);
+}
+
+test "parseRunRoute recognizes detail and stream routes" {
+    const detail = parseRunRoute("/v1/runs/run-123") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("run-123", detail.run_id);
+    try std.testing.expectEqual(false, detail.stream);
+
+    const stream = parseRunRoute("/v1/runs/run-123/stream") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("run-123", stream.run_id);
+    try std.testing.expectEqual(true, stream.stream);
+}
+
+test "buildRunDetailResponse returns metadata and event history" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const workspace_dir = try createTestWorkspaceDir(allocator, &tmp);
+    defer allocator.free(workspace_dir);
+
+    const sink = try GatewayRunSink.init(allocator, workspace_dir, "run-detail", testAssertedIdentity(), null);
+    sink.emitPrompt("inspect koala");
+    sink.emitToolCall("koala__snapshot", "{\"camera\":\"front\"}");
+    sink.emitModelOutput("snapshot queued");
+    sink.finishStream();
+    sink.deinit();
+
+    const payload = try buildRunDetailResponse(allocator, workspace_dir, "run-detail");
+    defer allocator.free(payload);
+
+    try std.testing.expect(std.mem.indexOf(u8, payload, "\"id\":\"run-detail\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "\"status\":\"done\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "\"tool\":\"koala__snapshot\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "\"type\":\"done\"") != null);
 }

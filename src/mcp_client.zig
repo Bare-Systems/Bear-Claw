@@ -14,6 +14,7 @@
 ///   - initialize → notifications/initialized → tools/list → tools/call
 ///
 const std = @import("std");
+const HTTP_MCP_PSEUDO_COMMAND = "http_mcp";
 
 /// A single discovered MCP tool with its name and description.
 pub const McpTool = struct {
@@ -38,11 +39,26 @@ const PROBE_TIMEOUT_MS: i32 = 8000;
 /// A running MCP server session. Owns the child process and its stdio.
 pub const McpSession = struct {
     allocator:  std.mem.Allocator,
-    child:      std.process.Child,
     next_id:    u32,
     /// When > 0, readLine uses poll() with this timeout (ms) instead of blocking.
     /// 0 means block indefinitely (normal pool sessions).
     timeout_ms: i32,
+    transport:  Transport,
+
+    const TransportKind = enum {
+        stdio,
+        http,
+    };
+
+    const Transport = union(TransportKind) {
+        stdio: std.process.Child,
+        http: HttpTransport,
+    };
+
+    const HttpTransport = struct {
+        url: []const u8,
+        bearer_token: []const u8,
+    };
 
     /// Start an MCP server and complete the handshake.
     /// `argv` must be the full command+args slice, e.g. &[_][]const u8{"trader","mcp","serve"}.
@@ -58,6 +74,25 @@ pub const McpSession = struct {
     }
 
     fn startInternal(allocator: std.mem.Allocator, argv: []const []const u8, timeout_ms: i32) !McpSession {
+        if (argv.len > 0 and std.mem.eql(u8, argv[0], HTTP_MCP_PSEUDO_COMMAND)) {
+            if (argv.len < 3) return error.InvalidMcpHttpConfig;
+
+            var session = McpSession{
+                .allocator  = allocator,
+                .next_id    = 1,
+                .timeout_ms = timeout_ms,
+                .transport  = .{
+                    .http = .{
+                        .url = argv[1],
+                        .bearer_token = argv[2],
+                    },
+                },
+            };
+
+            try session.handshake();
+            return session;
+        }
+
         var child = std.process.Child.init(argv, allocator);
         child.stdin_behavior  = .Pipe;
         child.stdout_behavior = .Pipe;
@@ -67,9 +102,9 @@ pub const McpSession = struct {
 
         var session = McpSession{
             .allocator  = allocator,
-            .child      = child,
             .next_id    = 1,
             .timeout_ms = timeout_ms,
+            .transport  = .{ .stdio = child },
         };
 
         // Perform MCP handshake: initialize request → response → initialized notification.
@@ -78,12 +113,16 @@ pub const McpSession = struct {
     }
 
     pub fn deinit(self: *McpSession) void {
-        // Close stdin to signal EOF to the child, then wait for it to exit.
-        if (self.child.stdin) |stdin| {
-            stdin.close();
-            self.child.stdin = null;
+        switch (self.transport) {
+            .stdio => |*child| {
+                if (child.stdin) |stdin| {
+                    stdin.close();
+                    child.stdin = null;
+                }
+                _ = child.wait() catch {};
+            },
+            .http => {},
         }
-        _ = self.child.wait() catch {};
         self.* = undefined;
     }
 
@@ -102,10 +141,14 @@ pub const McpSession = struct {
         );
         defer self.allocator.free(msg);
 
-        const stdin = self.child.stdin orelse return error.NoStdin;
-        try stdin.writeAll(msg);
-
-        return self.readLine();
+        return switch (self.transport) {
+            .stdio => |*child| blk: {
+                const stdin = child.stdin orelse return error.NoStdin;
+                try stdin.writeAll(msg);
+                break :blk try self.readLine();
+            },
+            .http => |http| self.requestHttp(msg, http),
+        };
     }
 
     /// Send a JSON-RPC notification (no id, no response expected).
@@ -117,8 +160,13 @@ pub const McpSession = struct {
         );
         defer self.allocator.free(msg);
 
-        const stdin = self.child.stdin orelse return error.NoStdin;
-        try stdin.writeAll(msg);
+        switch (self.transport) {
+            .stdio => |*child| {
+                const stdin = child.stdin orelse return error.NoStdin;
+                try stdin.writeAll(msg);
+            },
+            .http => {},
+        }
     }
 
     /// Read a single newline-terminated line from the child's stdout.
@@ -126,7 +174,10 @@ pub const McpSession = struct {
     /// If self.timeout_ms > 0, each byte read is preceded by a poll() that
     /// returns error.TimedOut if the server doesn't respond within the deadline.
     fn readLine(self: *McpSession) ![]u8 {
-        const stdout = self.child.stdout orelse return error.NoStdout;
+        const stdout = switch (self.transport) {
+            .stdio => |*child| child.stdout orelse return error.NoStdout,
+            .http => return error.InvalidTransport,
+        };
         var line = std.ArrayList(u8).init(self.allocator);
         errdefer line.deinit();
 
@@ -160,8 +211,9 @@ pub const McpSession = struct {
         const resp = try self.request("initialize", init_params);
         defer self.allocator.free(resp);
 
-        // Send the initialized notification (no response expected).
-        try self.notify("notifications/initialized", "{}");
+        if (self.transport == .stdio) {
+            try self.notify("notifications/initialized", "{}");
+        }
     }
 
     /// Discover all tools exposed by this MCP server.
@@ -258,6 +310,8 @@ pub const McpSession = struct {
             if (err_val == .object) {
                 if (err_val.object.get("message")) |msg_val| {
                     if (msg_val == .string) {
+                        if (std.mem.indexOf(u8, msg_val.string, "rate limit") != null) return error.McpRateLimited;
+                        if (std.mem.indexOf(u8, msg_val.string, "unauthorized") != null) return error.McpUnauthorized;
                         return std.fmt.allocPrint(self.allocator, "(mcp error: {s})", .{msg_val.string});
                     }
                 }
@@ -277,6 +331,21 @@ pub const McpSession = struct {
             }
             break :blk false;
         };
+
+        if (is_error and result_val == .object) {
+            if (result_val.object.get("structuredContent")) |structured| {
+                if (structured == .object) {
+                    if (structured.object.get("error_code")) |code_val| {
+                        if (code_val == .string) {
+                            if (std.mem.eql(u8, code_val.string, "rate_limited")) return error.McpRateLimited;
+                            if (std.mem.eql(u8, code_val.string, "unavailable")) return error.McpProviderUnavailable;
+                            if (std.mem.eql(u8, code_val.string, "unauthorized")) return error.McpUnauthorized;
+                            if (std.mem.eql(u8, code_val.string, "invalid_input")) return error.McpInvalidInput;
+                        }
+                    }
+                }
+            }
+        }
 
         const content_val: std.json.Value = blk: {
             if (result_val == .object) {
@@ -310,6 +379,42 @@ pub const McpSession = struct {
         }
 
         return out.toOwnedSlice();
+    }
+
+    fn requestHttp(self: *McpSession, payload_json: []const u8, transport: HttpTransport) ![]u8 {
+        const uri = std.Uri.parse(transport.url) catch return error.McpProviderUnavailable;
+
+        var client = std.http.Client{ .allocator = self.allocator };
+        defer client.deinit();
+
+        var response_buf = std.ArrayList(u8).init(self.allocator);
+        errdefer response_buf.deinit();
+
+        const auth_header = try std.fmt.allocPrint(self.allocator, "Bearer {s}", .{transport.bearer_token});
+        defer self.allocator.free(auth_header);
+
+        const result = client.fetch(.{
+            .method = .POST,
+            .location = .{ .uri = uri },
+            .headers = .{
+                .content_type = .{ .override = "application/json" },
+                .authorization = .{ .override = auth_header },
+            },
+            .payload = payload_json,
+            .response_storage = .{ .dynamic = &response_buf },
+        }) catch return error.McpProviderUnavailable;
+
+        switch (result.status) {
+            .ok, .accepted => return response_buf.toOwnedSlice(),
+            .too_many_requests => return error.McpRateLimited,
+            .unauthorized, .forbidden => return error.McpUnauthorized,
+            .bad_request => return error.McpInvalidInput,
+            else => {
+                const code: u16 = @intFromEnum(result.status);
+                if (code >= 500) return error.McpProviderUnavailable;
+                return error.McpProtocol;
+            },
+        }
     }
 };
 

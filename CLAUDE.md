@@ -237,6 +237,8 @@ BearClaw can use any MCP server as a tool source — no code changes required.
 bareclaw config set mcp_servers "autotrader=trader mcp serve"
 # Multiple servers: pipe-separated
 bareclaw config set mcp_servers "autotrader=trader mcp serve|mybot=python /path/to/bot.py"
+# HTTP MCP (for Koala-style endpoints)
+bareclaw config set mcp_servers "koala=http_mcp http://192.168.86.53:6705/mcp <koala_mcp_token>"
 ```
 
 **Via MCP server tools (for agent-driven setup):**
@@ -249,10 +251,14 @@ mcp_call_tool(server="autotrader", tool="get_status")
 
 **Format:** `mcp_servers = "name=command arg1 arg2|name2=cmd2 ..."` in `config.toml`
 
+For remote HTTP MCP endpoints, `command` is the pseudo-command `http_mcp` and
+the first two arguments are the MCP URL and bearer token.
+
 **What happens at agent startup:**
 1. `parseMcpServers()` splits the config string into `McpServerDef` entries
 2. `buildMcpTools()` spawns each server, completes the MCP handshake, calls `tools/list`
 3. Each discovered tool becomes a BearClaw `Tool` named `servername__toolname`
+   (for example Koala's `koala.get_zone_state` becomes `koala__get_zone_state`)
 4. `McpSessionPool` keeps sessions alive across tool calls in one agent run
 
 **Validation:** After adding a server, run:

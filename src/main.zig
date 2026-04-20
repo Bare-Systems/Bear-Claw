@@ -249,6 +249,7 @@ pub fn main() !void {
             if (server_defs.len == 0) {
                 try stdout.print("No MCP servers configured.\n", .{});
                 try stdout.print("Add one with: bareclaw config set mcp_servers \"name=command args\"\n", .{});
+                try stdout.print("          or: bareclaw config set mcp_servers \"koala=http_mcp http://host:6705/mcp <token>\"\n", .{});
             } else {
                 try stdout.print("{d} MCP server(s):\n", .{server_defs.len});
                 for (server_defs) |def| {
